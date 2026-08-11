@@ -142,12 +142,20 @@ func (r *chainRoute) Dial(ctx context.Context, network, address string, opts ...
 		return nil, err
 	}
 
-	cc, err := r.getNode(len(r.Nodes())-1).Options().Transport.Connect(ctx, conn, network, address)
+	node := r.getNode(len(r.Nodes()) - 1)
+	marker := node.Marker()
+	cc, err := node.Options().Transport.Connect(ctx, conn, network, address)
 	if err != nil {
 		if conn != nil {
 			conn.Close()
 		}
+		if marker != nil {
+			marker.Mark()
+		}
 		return nil, err
+	}
+	if marker != nil {
+		marker.Reset()
 	}
 	return cc, nil
 }
