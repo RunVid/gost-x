@@ -97,7 +97,7 @@ func (c *Chain) Route(ctx context.Context, network, address string, opts ...chai
 			hop.HostSelectOption(options.Host),
 		)
 		if node == nil {
-			return rt
+			return trackChainRoute(rt, c)
 		}
 		if node.Options().Transport.Multiplex() {
 			tr := node.Options().Transport.Copy()
@@ -109,7 +109,7 @@ func (c *Chain) Route(ctx context.Context, network, address string, opts ...chai
 
 		rt.addNode(node)
 	}
-	return rt
+	return trackChainRoute(rt, c)
 }
 
 type chainGroup struct {

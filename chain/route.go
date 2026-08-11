@@ -109,6 +109,41 @@ type chainRoute struct {
 	options RouteOptions
 }
 
+type chainTrackedRoute struct {
+	chain.Route
+	chainer chain.Chainer
+}
+
+// trackChainRoute records the outcome of the complete route. Nested route
+// segments still update their node markers, but must not reset the chain marker
+// before the destination operation has completed.
+func trackChainRoute(route chain.Route, chainer chain.Chainer) chain.Route {
+	return &chainTrackedRoute{
+		Route:   route,
+		chainer: chainer,
+	}
+}
+
+func (r *chainTrackedRoute) Dial(ctx context.Context, network, address string, opts ...chain.DialOption) (net.Conn, error) {
+	conn, err := r.Route.Dial(ctx, network, address, opts...)
+	r.updateMarker(err)
+	return conn, err
+}
+
+func (r *chainTrackedRoute) Bind(ctx context.Context, network, address string, opts ...chain.BindOption) (net.Listener, error) {
+	ln, err := r.Route.Bind(ctx, network, address, opts...)
+	r.updateMarker(err)
+	return ln, err
+}
+
+func (r *chainTrackedRoute) updateMarker(err error) {
+	markable, _ := r.chainer.(selector.Markable)
+	if markable == nil {
+		return
+	}
+	updateMarker(markable.Marker(), err)
+}
+
 func NewRoute(opts ...RouteOption) *chainRoute {
 	var options RouteOptions
 	for _, opt := range opts {
@@ -149,14 +184,10 @@ func (r *chainRoute) Dial(ctx context.Context, network, address string, opts ...
 		if conn != nil {
 			conn.Close()
 		}
-		if marker != nil {
-			marker.Mark()
-		}
+		updateMarker(marker, err)
 		return nil, err
 	}
-	if marker != nil {
-		marker.Reset()
-	}
+	updateMarker(marker, nil)
 	return cc, nil
 }
 
@@ -177,7 +208,9 @@ func (r *chainRoute) Bind(ctx context.Context, network, address string, opts ...
 		return nil, err
 	}
 
-	ln, err := r.getNode(len(r.Nodes())-1).Options().Transport.Bind(ctx,
+	node := r.getNode(len(r.Nodes()) - 1)
+	marker := node.Marker()
+	ln, err := node.Options().Transport.Bind(ctx,
 		conn, network, address,
 		connector.BacklogBindOption(options.Backlog),
 		connector.MuxBindOption(options.Mux),
@@ -187,9 +220,11 @@ func (r *chainRoute) Bind(ctx context.Context, network, address string, opts ...
 	)
 	if err != nil {
 		conn.Close()
+		updateMarker(marker, err)
 		return nil, err
 	}
 
+	updateMarker(marker, nil)
 	return ln, nil
 }
 
@@ -199,28 +234,16 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 
 	defer func() {
 		if r.options.Chain != nil {
-			var marker selector.Marker
-			if m, ok := r.options.Chain.(selector.Markable); ok && m != nil {
-				marker = m.Marker()
-			}
 			var name string
 			if cn, _ := r.options.Chain.(chainNamer); cn != nil {
 				name = cn.Name()
 			}
 			// chain error
 			if err != nil {
-				if marker != nil {
-					marker.Mark()
-				}
 				if v := xmetrics.GetCounter(xmetrics.MetricChainErrorsCounter,
 					metrics.Labels{"chain": name, "node": node.Name}); v != nil {
 					v.Inc()
 				}
-				return
-			}
-
-			if marker != nil {
-				marker.Reset()
 			}
 		}
 	}()
@@ -251,7 +274,8 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		}
 		return
 	}
-	if marker != nil {
+	// The final node is not healthy until its destination operation succeeds.
+	if marker != nil && len(r.nodes) > 1 {
 		marker.Reset()
 	}
 
@@ -267,7 +291,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 	}
 
 	preNode := node
-	for _, node := range r.nodes[1:] {
+	for i, node := range r.nodes[1:] {
 		marker := node.Marker()
 		addr, err = xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
 		if err != nil {
@@ -293,7 +317,8 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 			}
 			return
 		}
-		if marker != nil {
+		// Preserve the final node's previous failures until Dial or Bind succeeds.
+		if marker != nil && i+1 < len(r.nodes)-1 {
 			marker.Reset()
 		}
 
@@ -303,6 +328,17 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 
 	conn = cn
 	return
+}
+
+func updateMarker(marker selector.Marker, err error) {
+	if marker == nil {
+		return
+	}
+	if err != nil {
+		marker.Mark()
+		return
+	}
+	marker.Reset()
 }
 
 func (r *chainRoute) getNode(index int) *chain.Node {
