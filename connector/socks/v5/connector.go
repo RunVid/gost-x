@@ -28,6 +28,18 @@ type socks5Connector struct {
 	options  connector.Options
 }
 
+type replyError struct {
+	code uint8
+}
+
+func (e *replyError) Error() string {
+	return fmt.Sprintf("socks5 connect rejected with reply %d", e.code)
+}
+
+func (e *replyError) SOCKS5ReplyCode() uint8 {
+	return e.code
+}
+
 func NewConnector(opts ...connector.Option) connector.Connector {
 	options := connector.Options{}
 	for _, opt := range opts {
@@ -152,7 +164,7 @@ func (c *socks5Connector) Connect(ctx context.Context, conn net.Conn, network, a
 	log.Trace(reply)
 
 	if reply.Rep != gosocks5.Succeeded {
-		err = errors.New("host unreachable")
+		err = &replyError{code: reply.Rep}
 		log.Error(err)
 		return nil, err
 	}

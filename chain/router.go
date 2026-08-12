@@ -13,6 +13,7 @@ import (
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
 	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/pineevent"
 )
 
 type Router struct {
@@ -82,6 +83,8 @@ func (r *Router) record(ctx context.Context, name string, data []byte) error {
 }
 
 func (r *Router) dial(ctx context.Context, network, address string, log logger.Logger) (conn net.Conn, err error) {
+	startedAt := time.Now()
+	destinationHost, destinationPort := pineevent.Destination(address)
 	count := r.options.Retries + 1
 	if count <= 0 {
 		count = 1
@@ -89,6 +92,8 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 
 	log.Debugf("dial %s/%s", address, network)
 
+	attempts := 0
+	selectedRoute := pineevent.Route{Tier: "unselected", Kind: "unselected"}
 	for i := 0; i < count; i++ {
 		ctx := ctx
 		if r.options.Timeout > 0 {
@@ -130,19 +135,95 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		if route == nil {
 			route = DefaultRoute
 		}
+		attempts++
+		selectedRoute = pineRoute(route)
+		attemptStartedAt := time.Now()
 		conn, err = route.Dial(ctx, network, ipAddr,
 			chain.InterfaceDialOption(r.options.IfceName),
 			chain.NetnsDialOption(r.options.Netns),
 			chain.SockOptsDialOption(r.options.SockOpts),
 			chain.LoggerDialOption(log),
 		)
+		result := "success"
+		errorClass, socks5Reply := pineevent.ErrorDetails(err)
+		if err != nil {
+			result = "failure"
+		}
+		pineevent.Emit(pineevent.Event{
+			Kind:            "attempt",
+			ConnectionID:    xctx.SidFromContext(ctx).String(),
+			Network:         network,
+			DestinationHost: destinationHost,
+			DestinationPort: destinationPort,
+			RouteID:         selectedRoute.RouteID,
+			SourceListID:    selectedRoute.SourceListID,
+			Tier:            selectedRoute.Tier,
+			RouteKind:       selectedRoute.Kind,
+			Attempt:         attempts,
+			Result:          result,
+			ErrorClass:      errorClass,
+			SOCKS5Reply:     socks5Reply,
+			DurationMS:      time.Since(attemptStartedAt).Milliseconds(),
+		})
 		if err == nil {
 			break
 		}
 		log.Errorf("route(retry=%d) %s", i, err)
 	}
 
+	outcome := "failed"
+	if err == nil {
+		switch {
+		case selectedRoute.Kind == "direct":
+			outcome = "direct_fallback_success"
+		case attempts > 1:
+			outcome = "managed_failover_success"
+		default:
+			outcome = "success"
+		}
+		pineevent.SetSelectedRoute(ctx, selectedRoute, outcome)
+	}
+	errorClass, socks5Reply := pineevent.ErrorDetails(err)
+	pineevent.Emit(pineevent.Event{
+		Kind:            "request",
+		ConnectionID:    xctx.SidFromContext(ctx).String(),
+		Network:         network,
+		DestinationHost: destinationHost,
+		DestinationPort: destinationPort,
+		RouteID:         selectedRoute.RouteID,
+		SourceListID:    selectedRoute.SourceListID,
+		Tier:            selectedRoute.Tier,
+		RouteKind:       selectedRoute.Kind,
+		Attempts:        attempts,
+		Outcome:         outcome,
+		ErrorClass:      errorClass,
+		SOCKS5Reply:     socks5Reply,
+		DurationMS:      time.Since(startedAt).Milliseconds(),
+	})
+
 	return
+}
+
+func pineRoute(route chain.Route) pineevent.Route {
+	path := routePath(route)
+	if len(path) == 0 {
+		return pineevent.Route{Tier: "direct", Kind: "direct"}
+	}
+	node := path[len(path)-1]
+	md := node.Options().Metadata
+	if md == nil {
+		return pineevent.Route{Tier: "unselected", Kind: "unselected"}
+	}
+	stringValue := func(key string) string {
+		value, _ := md.Get(key).(string)
+		return value
+	}
+	return pineevent.Route{
+		RouteID:      stringValue("pine_route_id"),
+		SourceListID: stringValue("pine_source_list_id"),
+		Tier:         stringValue("pine_tier"),
+		Kind:         stringValue("pine_route_kind"),
+	}
 }
 
 func (r *Router) Bind(ctx context.Context, network, address string, opts ...chain.BindOption) (ln net.Listener, err error) {
