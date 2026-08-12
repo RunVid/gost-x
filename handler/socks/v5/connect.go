@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-gost/core/bypass"
@@ -16,7 +17,9 @@ import (
 	"github.com/go-gost/gosocks5"
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
+	xio "github.com/go-gost/x/internal/io"
 	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/pineevent"
 	"github.com/go-gost/x/internal/util/sniffing"
 	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
@@ -68,6 +71,7 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 	}
 
 	var buf bytes.Buffer
+	ctx, dialState := pineevent.ContextWithDialState(ctx)
 	cc, err := h.options.Router.Dial(ictx.ContextWithBuffer(ctx, &buf), network, address)
 	ro.Route = buf.String()
 	if err != nil {
@@ -145,10 +149,88 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 	t := time.Now()
 	log.Infof("%s <-> %s", conn.RemoteAddr(), address)
 	// xnet.Transport(conn, cc)
-	xnet.Pipe(ctx, conn, cc)
+	clientConn := &countingConn{Conn: conn, startedAt: t}
+	upstreamConn := &countingConn{Conn: cc, startedAt: t}
+	xnet.Pipe(ctx, clientConn, upstreamConn)
+	route, outcome := dialState.SelectedRoute()
+	destinationHost, destinationPort := pineevent.Destination(address)
+	pineevent.Emit(pineevent.Event{
+		Kind:                  "relay",
+		ConnectionID:          xctx.SidFromContext(ctx).String(),
+		Network:               network,
+		DestinationHost:       destinationHost,
+		DestinationPort:       destinationPort,
+		RouteID:               route.RouteID,
+		SourceListID:          route.SourceListID,
+		Tier:                  route.Tier,
+		RouteKind:             route.Kind,
+		Outcome:               outcome,
+		DurationMS:            time.Since(t).Milliseconds(),
+		FirstDownstreamByteMS: clientConn.FirstWriteMS(),
+		BytesUp:               upstreamConn.BytesWritten(),
+		BytesDown:             clientConn.BytesWritten(),
+		UploadActiveMS:        upstreamConn.ActiveWriteMS(),
+		DownloadActiveMS:      clientConn.ActiveWriteMS(),
+	})
 	log.WithFields(map[string]any{
 		"duration": time.Since(t),
 	}).Infof("%s >-< %s", conn.RemoteAddr(), address)
 
 	return nil
+}
+
+type countingConn struct {
+	net.Conn
+	bytesWritten atomic.Int64
+	firstWriteNS atomic.Int64
+	lastWriteNS  atomic.Int64
+	startedAt    time.Time
+}
+
+func (c *countingConn) Write(payload []byte) (int, error) {
+	started := time.Since(c.startedAt).Nanoseconds() + 1
+	n, err := c.Conn.Write(payload)
+	if n > 0 {
+		// Store nanoseconds + 1 so an immediate first byte is distinguishable
+		// from a connection that never delivered downstream data.
+		c.firstWriteNS.CompareAndSwap(0, started)
+		c.lastWriteNS.Store(time.Since(c.startedAt).Nanoseconds() + 1)
+	}
+	c.bytesWritten.Add(int64(n))
+	return n, err
+}
+
+func (c *countingConn) ActiveWriteMS() int64 {
+	first := c.firstWriteNS.Load()
+	last := c.lastWriteNS.Load()
+	if first == 0 || last < first {
+		return 0
+	}
+	return (last - first) / int64(time.Millisecond)
+}
+
+func (c *countingConn) FirstWriteMS() int64 {
+	value := c.firstWriteNS.Load()
+	if value == 0 {
+		return -1
+	}
+	return (value - 1) / int64(time.Millisecond)
+}
+
+func (c *countingConn) BytesWritten() int64 {
+	return c.bytesWritten.Load()
+}
+
+func (c *countingConn) CloseRead() error {
+	if connection, ok := c.Conn.(xio.CloseRead); ok {
+		return connection.CloseRead()
+	}
+	return xio.ErrUnsupported
+}
+
+func (c *countingConn) CloseWrite() error {
+	if connection, ok := c.Conn.(xio.CloseWrite); ok {
+		return connection.CloseWrite()
+	}
+	return xio.ErrUnsupported
 }
