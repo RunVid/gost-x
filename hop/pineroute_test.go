@@ -14,8 +14,20 @@ import (
 	xchain "github.com/go-gost/x/chain"
 	"github.com/go-gost/x/internal/pineroute"
 	xlogger "github.com/go-gost/x/logger"
+	mdx "github.com/go-gost/x/metadata"
 	xselector "github.com/go-gost/x/selector"
 )
+
+func TestMain(m *testing.M) {
+	pineroute.Enabled = true
+	m.Run()
+}
+
+func pineNode(id string, transport corechain.Transporter) *corechain.Node {
+	return corechain.NewNode(id, id+".example:1080",
+		corechain.TransportNodeOption(transport),
+		corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_id": id})))
+}
 
 type socksReply uint8
 
@@ -88,8 +100,8 @@ func TestDestinationRefusalDoesNotCoolDownRoute(t *testing.T) {
 	host := fmt.Sprintf("refused-%d.example", time.Now().UnixNano())
 	primary := &refusingTransport{refused: map[string]error{host: socksReply(2)}}
 	fallback := &refusingTransport{}
-	primaryNode := corechain.NewNode("primary-"+host, "primary.example:1080", corechain.TransportNodeOption(primary))
-	fallbackNode := corechain.NewNode("fallback-"+host, "fallback.example:1080", corechain.TransportNodeOption(fallback))
+	primaryNode := pineNode("er_primary_"+host, primary)
+	fallbackNode := pineNode("er_fallback_"+host, fallback)
 	r := newTestRouter(primaryNode, fallbackNode)
 
 	if err := dial(t, r, host+":443"); err != nil {
@@ -118,8 +130,8 @@ func TestDestinationRefusalDoesNotCoolDownRoute(t *testing.T) {
 func TestRouteFailureStillCoolsDownRoute(t *testing.T) {
 	host := fmt.Sprintf("broken-%d.example", time.Now().UnixNano())
 	primary := &refusingTransport{refused: map[string]error{host: socksReply(1)}}
-	primaryNode := corechain.NewNode("primary-"+host, "primary.example:1080", corechain.TransportNodeOption(primary))
-	fallbackNode := corechain.NewNode("fallback-"+host, "fallback.example:1080", corechain.TransportNodeOption(&refusingTransport{}))
+	primaryNode := pineNode("er_primary_"+host, primary)
+	fallbackNode := pineNode("er_fallback_"+host, &refusingTransport{})
 	r := newTestRouter(primaryNode, fallbackNode)
 
 	if err := dial(t, r, host+":443"); err != nil {
@@ -133,9 +145,9 @@ func TestRouteFailureStillCoolsDownRoute(t *testing.T) {
 func TestEveryRouteRefusedFailsWithoutDirectDial(t *testing.T) {
 	host := fmt.Sprintf("blocked-%d.example", time.Now().UnixNano())
 	a := &refusingTransport{refused: map[string]error{host: socksReply(2)}}
-	b := &refusingTransport{refused: map[string]error{host: socksReply(5)}}
-	nodeA := corechain.NewNode("a-"+host, "a.example:1080", corechain.TransportNodeOption(a))
-	nodeB := corechain.NewNode("b-"+host, "b.example:1080", corechain.TransportNodeOption(b))
+	b := &refusingTransport{refused: map[string]error{host: socksReply(2)}}
+	nodeA := pineNode("er_a_"+host, a)
+	nodeB := pineNode("er_b_"+host, b)
 	r := newTestRouter(nodeA, nodeB)
 
 	if err := dial(t, r, host+":443"); err == nil {
