@@ -139,7 +139,10 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		// excluded, so fail instead of falling through to GOST's implicit
 		// direct route.
 		if pineroute.Enabled && r.options.Chain != nil && (route == nil || len(route.Nodes()) == 0) {
-			err = pineroute.ErrNoRoute
+			err = ctx.Err()
+			if err == nil {
+				err = pineroute.ErrNoRoute
+			}
 			break
 		}
 		if route == nil {

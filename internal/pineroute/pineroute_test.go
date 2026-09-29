@@ -95,6 +95,26 @@ func TestRefusalCacheStaysBounded(t *testing.T) {
 	if len(cache.entries) > 4 {
 		t.Fatalf("cache holds %d entries, want at most 4", len(cache.entries))
 	}
+
+	cache = newRefusalCache(time.Hour, 2)
+	cache.add("route-a", "old.example", now)
+	cache.add("route-a", "kept.example", now.Add(time.Minute))
+	cache.add("route-a", "new.example", now.Add(2*time.Minute))
+	if cache.contains("route-a", "old.example", now.Add(2*time.Minute)) {
+		t.Fatal("a full cache kept its oldest refusal")
+	}
+	if !cache.contains("route-a", "kept.example", now.Add(2*time.Minute)) {
+		t.Fatal("a full cache dropped a newer live refusal")
+	}
+}
+
+func TestNestedDialGetsFreshAttempts(t *testing.T) {
+	node := pineNode("er_route_nested")
+	outer := WithAttempts(context.Background())
+	MarkTried(outer, node)
+	if Skip(WithAttempts(outer), node, "example.com:443") {
+		t.Fatal("a nested dial inherited the outer request's attempts")
+	}
 }
 
 func TestDisabledOutsidePine(t *testing.T) {

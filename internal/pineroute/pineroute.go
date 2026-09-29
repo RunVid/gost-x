@@ -68,12 +68,11 @@ type attempts struct {
 	tried map[string]struct{}
 }
 
-// WithAttempts returns a context that tracks the routes tried by one request.
+// WithAttempts returns a context that tracks the routes tried by one router
+// dial. A nested dial, such as DNS resolution through the chain, gets its own
+// set so its attempts do not exclude routes for the outer request.
 func WithAttempts(ctx context.Context) context.Context {
 	if !Enabled {
-		return ctx
-	}
-	if _, ok := ctx.Value(attemptsKey{}).(*attempts); ok {
 		return ctx
 	}
 	return context.WithValue(ctx, attemptsKey{}, &attempts{tried: map[string]struct{}{}})
@@ -160,14 +159,19 @@ func (c *refusalCache) add(routeID, host string, now time.Time) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.entries) >= c.limit {
+	if _, ok := c.entries[key]; !ok && len(c.entries) >= c.limit {
+		oldestKey, oldest := "", time.Time{}
 		for k, expires := range c.entries {
 			if !now.Before(expires) {
 				delete(c.entries, k)
+				continue
+			}
+			if oldestKey == "" || expires.Before(oldest) {
+				oldestKey, oldest = k, expires
 			}
 		}
 		if len(c.entries) >= c.limit {
-			c.entries = map[string]time.Time{}
+			delete(c.entries, oldestKey)
 		}
 	}
 	c.entries[key] = now.Add(c.ttl)
