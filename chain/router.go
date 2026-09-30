@@ -138,8 +138,11 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		// node in automatic mode. An empty selection means every route was
 		// excluded, so fail instead of falling through to GOST's implicit
 		// direct route.
-		if r.options.Chain != nil && (route == nil || len(route.Nodes()) == 0) {
-			err = pineroute.ErrNoRoute
+		if pineroute.Enabled && r.options.Chain != nil && (route == nil || len(route.Nodes()) == 0) {
+			err = ctx.Err()
+			if err == nil {
+				err = pineroute.ErrNoRoute
+			}
 			break
 		}
 		if route == nil {
@@ -157,7 +160,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		if path := routePath(route); len(path) > 0 {
 			node := path[len(path)-1]
 			pineroute.MarkTried(ctx, node)
-			if pineroute.DestinationScoped(err) {
+			if pineroute.DestinationScoped(network, err) {
 				pineroute.RecordRefusal(node, destinationHost)
 			}
 		}

@@ -8,7 +8,19 @@ import (
 	"time"
 
 	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/metadata"
+	mdx "github.com/go-gost/x/metadata"
 )
+
+func TestMain(m *testing.M) {
+	Enabled = true
+	m.Run()
+}
+
+func pineNode(id string) *chain.Node {
+	var md metadata.Metadata = mdx.NewMetadata(map[string]any{"pine_route_id": id})
+	return chain.NewNode(id, "proxy.example:1080", chain.MetadataNodeOption(md))
+}
 
 type replyError uint8
 
@@ -20,22 +32,25 @@ func TestDestinationScoped(t *testing.T) {
 		err  error
 		want bool
 	}{
-		"not allowed":        {replyError(2), true},
-		"connection refused": {fmt.Errorf("wrapped: %w", replyError(5)), true},
+		"not allowed":        {fmt.Errorf("wrapped: %w", replyError(2)), true},
+		"connection refused": {replyError(5), false},
 		"general failure":    {replyError(1), false},
 		"host unreachable":   {replyError(4), false},
 		"plain error":        {errors.New("dial tcp: i/o timeout"), false},
 		"nil":                {nil, false},
 	}
 	for name, tc := range cases {
-		if got := DestinationScoped(tc.err); got != tc.want {
+		if got := DestinationScoped("tcp", tc.err); got != tc.want {
 			t.Errorf("%s: DestinationScoped = %v, want %v", name, got, tc.want)
 		}
+	}
+	if DestinationScoped("udp", replyError(2)) {
+		t.Error("a UDP reply was treated as a destination refusal")
 	}
 }
 
 func TestSkipTracksTriedNodesPerRequest(t *testing.T) {
-	node := chain.NewNode("route-a", "proxy.example:1080")
+	node := pineNode("er_route_a")
 	if Skip(context.Background(), node, "example.com:443") {
 		t.Fatal("untracked request skipped a node")
 	}
@@ -46,6 +61,9 @@ func TestSkipTracksTriedNodesPerRequest(t *testing.T) {
 	}
 	if Skip(WithAttempts(context.Background()), node, "example.com:443") {
 		t.Fatal("tried node leaked into another request")
+	}
+	if Skip(first, chain.NewNode("direct-fallback", ""), "example.com:443") {
+		t.Fatal("a node without a Pine route id was skipped")
 	}
 }
 
@@ -76,5 +94,36 @@ func TestRefusalCacheStaysBounded(t *testing.T) {
 	}
 	if len(cache.entries) > 4 {
 		t.Fatalf("cache holds %d entries, want at most 4", len(cache.entries))
+	}
+
+	cache = newRefusalCache(time.Hour, 2)
+	cache.add("route-a", "old.example", now)
+	cache.add("route-a", "kept.example", now.Add(time.Minute))
+	cache.add("route-a", "new.example", now.Add(2*time.Minute))
+	if cache.contains("route-a", "old.example", now.Add(2*time.Minute)) {
+		t.Fatal("a full cache kept its oldest refusal")
+	}
+	if !cache.contains("route-a", "kept.example", now.Add(2*time.Minute)) {
+		t.Fatal("a full cache dropped a newer live refusal")
+	}
+}
+
+func TestNestedDialGetsFreshAttempts(t *testing.T) {
+	node := pineNode("er_route_nested")
+	outer := WithAttempts(context.Background())
+	MarkTried(outer, node)
+	if Skip(WithAttempts(outer), node, "example.com:443") {
+		t.Fatal("a nested dial inherited the outer request's attempts")
+	}
+}
+
+func TestDisabledOutsidePine(t *testing.T) {
+	Enabled = false
+	defer func() { Enabled = true }()
+	if DestinationScoped("tcp", replyError(2)) {
+		t.Fatal("a refusal was scoped to the destination outside Pine")
+	}
+	if Tracking(WithAttempts(context.Background())) {
+		t.Fatal("attempts were tracked outside Pine")
 	}
 }
