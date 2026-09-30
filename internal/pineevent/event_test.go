@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/go-gost/x/internal/pineroute"
 )
 
 type testSOCKS5ReplyError uint8
@@ -26,6 +28,7 @@ func TestErrorDetails(t *testing.T) {
 		{name: "unknown SOCKS reply", err: testSOCKS5ReplyError(9), wantClass: "socks5_reply", wantReply: "unknown"},
 		{name: "deadline", err: context.DeadlineExceeded, wantClass: "timeout"},
 		{name: "DNS", err: &net.DNSError{Err: "no such host", Name: "example.invalid"}, wantClass: "dns"},
+		{name: "no route", err: pineroute.ErrNoRoute, wantClass: "no_route"},
 		{name: "generic", err: errors.New("failed"), wantClass: "connect_error"},
 	}
 

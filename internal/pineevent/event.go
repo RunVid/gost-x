@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-gost/x/internal/pineroute"
 )
 
 const (
@@ -97,6 +99,9 @@ func ErrorDetails(err error) (class, reply string) {
 		return "", ""
 	}
 
+	if errors.Is(err, pineroute.ErrNoRoute) {
+		return "no_route", ""
+	}
 	var socksErr socks5ReplyError
 	if errors.As(err, &socksErr) {
 		return "socks5_reply", socks5ReplyName(socksErr.SOCKS5ReplyCode())

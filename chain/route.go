@@ -15,6 +15,7 @@ import (
 	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/dialer"
 	"github.com/go-gost/x/internal/net/udp"
+	"github.com/go-gost/x/internal/pineroute"
 	xmetrics "github.com/go-gost/x/metrics"
 )
 
@@ -138,7 +139,7 @@ func (r *chainTrackedRoute) Bind(ctx context.Context, network, address string, o
 
 func (r *chainTrackedRoute) updateMarker(err error) {
 	markable, _ := r.chainer.(selector.Markable)
-	if markable == nil {
+	if markable == nil || pineroute.DestinationScoped(err) {
 		return
 	}
 	updateMarker(markable.Marker(), err)
@@ -184,7 +185,9 @@ func (r *chainRoute) Dial(ctx context.Context, network, address string, opts ...
 		if conn != nil {
 			conn.Close()
 		}
-		updateMarker(marker, err)
+		if !pineroute.DestinationScoped(err) {
+			updateMarker(marker, err)
+		}
 		return nil, err
 	}
 	updateMarker(marker, nil)
