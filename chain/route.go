@@ -15,6 +15,7 @@ import (
 	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/net/dialer"
 	"github.com/go-gost/x/internal/net/udp"
+	"github.com/go-gost/x/internal/pineroute"
 	xmetrics "github.com/go-gost/x/metrics"
 )
 
@@ -126,19 +127,19 @@ func trackChainRoute(route chain.Route, chainer chain.Chainer) chain.Route {
 
 func (r *chainTrackedRoute) Dial(ctx context.Context, network, address string, opts ...chain.DialOption) (net.Conn, error) {
 	conn, err := r.Route.Dial(ctx, network, address, opts...)
-	r.updateMarker(err)
+	r.updateMarker(network, err)
 	return conn, err
 }
 
 func (r *chainTrackedRoute) Bind(ctx context.Context, network, address string, opts ...chain.BindOption) (net.Listener, error) {
 	ln, err := r.Route.Bind(ctx, network, address, opts...)
-	r.updateMarker(err)
+	r.updateMarker("", err)
 	return ln, err
 }
 
-func (r *chainTrackedRoute) updateMarker(err error) {
+func (r *chainTrackedRoute) updateMarker(network string, err error) {
 	markable, _ := r.chainer.(selector.Markable)
-	if markable == nil {
+	if markable == nil || pineroute.DestinationScoped(network, err) {
 		return
 	}
 	updateMarker(markable.Marker(), err)
@@ -184,7 +185,9 @@ func (r *chainRoute) Dial(ctx context.Context, network, address string, opts ...
 		if conn != nil {
 			conn.Close()
 		}
-		updateMarker(marker, err)
+		if !pineroute.DestinationScoped(network, err) {
+			updateMarker(marker, err)
+		}
 		return nil, err
 	}
 	updateMarker(marker, nil)

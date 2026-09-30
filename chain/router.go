@@ -14,6 +14,7 @@ import (
 	ictx "github.com/go-gost/x/internal/ctx"
 	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/pineevent"
+	"github.com/go-gost/x/internal/pineroute"
 )
 
 type Router struct {
@@ -94,6 +95,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 
 	attempts := 0
 	selectedRoute := pineevent.Route{Tier: "unselected", Kind: "unselected"}
+	ctx = pineroute.WithAttempts(ctx)
 	for i := 0; i < count; i++ {
 		ctx := ctx
 		if r.options.Timeout > 0 {
@@ -132,6 +134,17 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		fmt.Fprintf(buf, "%s", ipAddr)
 		log.Debugf("route(retry=%d) %s", i, buf.String())
 
+		// Pine chains list every allowed exit, including an explicit direct
+		// node in automatic mode. An empty selection means every route was
+		// excluded, so fail instead of falling through to GOST's implicit
+		// direct route.
+		if pineroute.Enabled && r.options.Chain != nil && (route == nil || len(route.Nodes()) == 0) {
+			err = ctx.Err()
+			if err == nil {
+				err = pineroute.ErrNoRoute
+			}
+			break
+		}
 		if route == nil {
 			route = DefaultRoute
 		}
@@ -144,6 +157,13 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			chain.SockOptsDialOption(r.options.SockOpts),
 			chain.LoggerDialOption(log),
 		)
+		if path := routePath(route); len(path) > 0 {
+			node := path[len(path)-1]
+			pineroute.MarkTried(ctx, node)
+			if pineroute.DestinationScoped(network, err) {
+				pineroute.RecordRefusal(node, destinationHost)
+			}
+		}
 		result := "success"
 		errorClass, socks5Reply := pineevent.ErrorDetails(err)
 		if err != nil {

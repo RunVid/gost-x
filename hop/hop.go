@@ -19,6 +19,7 @@ import (
 	"github.com/go-gost/x/config"
 	node_parser "github.com/go-gost/x/config/parsing/node"
 	"github.com/go-gost/x/internal/loader"
+	"github.com/go-gost/x/internal/pineroute"
 	xlogger "github.com/go-gost/x/logger"
 )
 
@@ -147,6 +148,9 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	var nodes []*chain.Node
 	for _, node := range p.Nodes() {
 		if node == nil {
+			continue
+		}
+		if pineroute.Skip(ctx, node, options.Host) {
 			continue
 		}
 		// node level bypass
