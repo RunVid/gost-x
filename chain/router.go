@@ -94,9 +94,14 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 	log.Debugf("dial %s/%s", address, network)
 
 	attempts := 0
+	var lastAttemptErr error
 	selectedRoute := pineevent.Route{Tier: "unselected", Kind: "unselected"}
 	ctx = pineroute.WithAttempts(ctx)
 	for i := 0; i < count; i++ {
+		if pineroute.Enabled && ctx.Err() != nil {
+			err = ctx.Err()
+			break
+		}
 		ctx := ctx
 		if r.options.Timeout > 0 {
 			var cancel context.CancelFunc
@@ -139,8 +144,11 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		// excluded, so fail instead of falling through to GOST's implicit
 		// direct route.
 		if pineroute.Enabled && r.options.Chain != nil && (route == nil || len(route.Nodes()) == 0) {
-			err = ctx.Err()
-			if err == nil {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			} else if lastAttemptErr != nil {
+				err = lastAttemptErr
+			} else {
 				err = pineroute.ErrNoRoute
 			}
 			break
@@ -157,12 +165,11 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			chain.SockOptsDialOption(r.options.SockOpts),
 			chain.LoggerDialOption(log),
 		)
+		lastAttemptErr = err
 		if path := routePath(route); len(path) > 0 {
 			node := path[len(path)-1]
 			pineroute.MarkTried(ctx, node)
-			if pineroute.DestinationScoped(network, err) {
-				pineroute.RecordRefusal(node, destinationHost)
-			}
+			pineroute.RecordRefusal(ctx, node, network, address, err)
 		}
 		result := "success"
 		errorClass, socks5Reply := pineevent.ErrorDetails(err)

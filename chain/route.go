@@ -127,19 +127,23 @@ func trackChainRoute(route chain.Route, chainer chain.Chainer) chain.Route {
 
 func (r *chainTrackedRoute) Dial(ctx context.Context, network, address string, opts ...chain.DialOption) (net.Conn, error) {
 	conn, err := r.Route.Dial(ctx, network, address, opts...)
-	r.updateMarker(network, err)
+	r.updateMarker(ctx, network, err)
 	return conn, err
 }
 
 func (r *chainTrackedRoute) Bind(ctx context.Context, network, address string, opts ...chain.BindOption) (net.Listener, error) {
 	ln, err := r.Route.Bind(ctx, network, address, opts...)
-	r.updateMarker("", err)
+	r.updateMarker(ctx, "", err)
 	return ln, err
 }
 
-func (r *chainTrackedRoute) updateMarker(network string, err error) {
+func (r *chainTrackedRoute) updateMarker(ctx context.Context, network string, err error) {
 	markable, _ := r.chainer.(selector.Markable)
-	if markable == nil || pineroute.DestinationScoped(network, err) {
+	var node *chain.Node
+	if nodes := routePath(r.Route); len(nodes) > 0 {
+		node = nodes[len(nodes)-1]
+	}
+	if markable == nil || pineroute.IgnoreFailure(ctx, node, network, err) {
 		return
 	}
 	updateMarker(markable.Marker(), err)
@@ -175,7 +179,7 @@ func (r *chainRoute) Dial(ctx context.Context, network, address string, opts ...
 	}
 	conn, err := r.connect(ctx, options.Logger)
 	if err != nil {
-		return nil, err
+		return nil, pineroute.UpstreamFailure(err)
 	}
 
 	node := r.getNode(len(r.Nodes()) - 1)
@@ -185,7 +189,7 @@ func (r *chainRoute) Dial(ctx context.Context, network, address string, opts ...
 		if conn != nil {
 			conn.Close()
 		}
-		if !pineroute.DestinationScoped(network, err) {
+		if !pineroute.IgnoreFailure(ctx, node, network, err) {
 			updateMarker(marker, err)
 		}
 		return nil, err
@@ -254,7 +258,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 	addr, err := xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
 	marker := node.Marker()
 	if err != nil {
-		if marker != nil {
+		if marker != nil && !pineroute.RequestCanceled(ctx, err) {
 			marker.Mark()
 		}
 		return
@@ -263,7 +267,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 	start := time.Now()
 	cc, err := node.Options().Transport.Dial(ctx, addr)
 	if err != nil {
-		if marker != nil {
+		if marker != nil && !pineroute.RequestCanceled(ctx, err) {
 			marker.Mark()
 		}
 		return
@@ -272,7 +276,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 	cn, err := node.Options().Transport.Handshake(ctx, cc)
 	if err != nil {
 		cc.Close()
-		if marker != nil {
+		if marker != nil && !pineroute.RequestCanceled(ctx, err) {
 			marker.Mark()
 		}
 		return
@@ -299,7 +303,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		addr, err = xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
 		if err != nil {
 			cn.Close()
-			if marker != nil {
+			if marker != nil && !pineroute.RequestCanceled(ctx, err) {
 				marker.Mark()
 			}
 			return
@@ -307,7 +311,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		cc, err = preNode.Options().Transport.Connect(ctx, cn, "tcp", addr)
 		if err != nil {
 			cn.Close()
-			if marker != nil {
+			if marker != nil && !pineroute.RequestCanceled(ctx, err) {
 				marker.Mark()
 			}
 			return
@@ -315,7 +319,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		cc, err = node.Options().Transport.Handshake(ctx, cc)
 		if err != nil {
 			cn.Close()
-			if marker != nil {
+			if marker != nil && !pineroute.RequestCanceled(ctx, err) {
 				marker.Mark()
 			}
 			return

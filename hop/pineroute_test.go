@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,12 +38,18 @@ func (e socksReply) Error() string {
 func (e socksReply) SOCKS5ReplyCode() uint8 { return uint8(e) }
 
 type refusingTransport struct {
-	refused  map[string]error
-	connects atomic.Int32
-	options  corechain.TransportOptions
+	refused       map[string]error
+	dialErr       error
+	handshakeErr  error
+	cancelConnect bool
+	connects      atomic.Int32
+	options       corechain.TransportOptions
 }
 
 func (t *refusingTransport) Dial(context.Context, string) (net.Conn, error) {
+	if t.dialErr != nil {
+		return nil, t.dialErr
+	}
 	client, peer := net.Pipe()
 	go func() {
 		defer peer.Close()
@@ -52,11 +59,18 @@ func (t *refusingTransport) Dial(context.Context, string) (net.Conn, error) {
 }
 
 func (t *refusingTransport) Handshake(_ context.Context, conn net.Conn) (net.Conn, error) {
-	return conn, nil
+	return conn, t.handshakeErr
 }
 
-func (t *refusingTransport) Connect(_ context.Context, conn net.Conn, _, address string) (net.Conn, error) {
+func (t *refusingTransport) Connect(ctx context.Context, conn net.Conn, _, address string) (net.Conn, error) {
 	t.connects.Add(1)
+	if t.cancelConnect {
+		<-ctx.Done()
+		return conn, ctx.Err()
+	}
+	if err := t.refused[address]; err != nil {
+		return conn, err
+	}
 	host, _, _ := net.SplitHostPort(address)
 	if err := t.refused[host]; err != nil {
 		return conn, err
@@ -162,5 +176,239 @@ func TestEveryRouteRefusedFailsWithoutDirectDial(t *testing.T) {
 	}
 	if nodeA.Marker().Count() != 0 || nodeB.Marker().Count() != 0 {
 		t.Fatal("destination refusals put routes into cooldown")
+	}
+}
+
+func TestDestinationFailuresLeaveOtherHostsAndPortsUsable(t *testing.T) {
+	for _, reply := range []socksReply{2, 3, 4, 5, 6, 8} {
+		t.Run(fmt.Sprint(reply), func(t *testing.T) {
+			host := fmt.Sprintf("endpoint-%d-%d.example", reply, time.Now().UnixNano())
+			a := &refusingTransport{refused: map[string]error{host + ":80": reply}}
+			b := &refusingTransport{refused: map[string]error{host + ":80": reply}}
+			nodes := []*corechain.Node{pineNode("er_a_"+host, a), pineNode("er_b_"+host, b)}
+			r := newTestRouter(nodes...)
+			// A larger retry budget must never repeat an exhausted node or
+			// discard the last useful error in favour of generic no_route.
+			r.Options().Retries = 8
+			if err := dial(t, r, host+":80"); !errors.Is(err, reply) {
+				t.Fatalf("error=%v, want reply %d", err, reply)
+			}
+			if a.connects.Load() != 1 || b.connects.Load() != 1 {
+				t.Fatal("route retried in the same request")
+			}
+			if err := dial(t, r, host+":443"); err != nil {
+				t.Fatalf("other port broken: %v", err)
+			}
+			if err := dial(t, r, "healthy.example:443"); err != nil {
+				t.Fatalf("other host broken: %v", err)
+			}
+			for _, node := range nodes {
+				if node.Marker().Count() != 0 {
+					t.Fatal("destination failure cooled shared route")
+				}
+			}
+			if err := dial(t, r, host+":80"); !errors.Is(err, pineroute.ErrNoRoute) {
+				t.Fatalf("repeat request did not use bounded cache: %v", err)
+			}
+		})
+	}
+}
+
+func TestDirectDestinationFailureDoesNotCoolFallback(t *testing.T) {
+	for _, failure := range []error{&net.DNSError{IsNotFound: true}, errors.New("connection refused"), context.DeadlineExceeded} {
+		host := fmt.Sprintf("direct-%d.example", time.Now().UnixNano())
+		a := pineNode("er_a_"+host, &refusingTransport{refused: map[string]error{host: socksReply(4), "healthy.example": socksReply(2)}})
+		b := pineNode("er_b_"+host, &refusingTransport{refused: map[string]error{host: socksReply(4), "healthy.example": socksReply(2)}})
+		transport := &refusingTransport{refused: map[string]error{host: failure}}
+		direct := corechain.NewNode("direct", "", corechain.TransportNodeOption(transport), corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct", "backup": true})))
+		r := newTestRouter(a, b, direct)
+		r.Options().Retries = 8
+		if err := dial(t, r, host+":443"); !errors.Is(err, failure) {
+			t.Fatalf("lost destination error: %v", err)
+		}
+		if transport.connects.Load() != 1 {
+			t.Fatal("direct connector retried for one request")
+		}
+		if direct.Marker().Count() != 0 {
+			t.Fatal("destination error cooled direct fallback")
+		}
+		if err := dial(t, r, "healthy.example:443"); err != nil {
+			t.Fatalf("healthy direct destination broken: %v", err)
+		}
+	}
+}
+
+func TestDirectRefusalDoesNotCrossRouterOrReloadBoundary(t *testing.T) {
+	host := fmt.Sprintf("independent-direct-%d.example:443", time.Now().UnixNano())
+	failure := errors.New("destination unavailable on this direct connector")
+	newDirect := func(transport *refusingTransport) *corechain.Node {
+		// Names and metadata intentionally match, as independently loaded
+		// Pine configurations use the same direct-fallback name.
+		return corechain.NewNode("direct-fallback", "",
+			corechain.TransportNodeOption(transport),
+			corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct"})))
+	}
+	broken := &refusingTransport{refused: map[string]error{host: failure}}
+	brokenNode := newDirect(broken)
+	brokenRouter := newTestRouter(brokenNode)
+	if err := dial(t, brokenRouter, host); !errors.Is(err, failure) {
+		t.Fatalf("initial direct failure=%v, want %v", err, failure)
+	}
+	if err := dial(t, brokenRouter, host); !errors.Is(err, pineroute.ErrNoRoute) || broken.connects.Load() != 1 {
+		t.Fatalf("same connector lost its refusal cache: err=%v attempts=%d", err, broken.connects.Load())
+	}
+	// GOST can copy nodes while constructing multiplexed routes. Copies of
+	// one connector must keep its identity instead of bypassing the cache.
+	if err := dial(t, newTestRouter(brokenNode.Copy()), host); !errors.Is(err, pineroute.ErrNoRoute) {
+		t.Fatalf("a node copy bypassed its connector's refusal: %v", err)
+	}
+	for _, name := range []string{"independent router", "replacement after reload"} {
+		t.Run(name, func(t *testing.T) {
+			healthy := &refusingTransport{}
+			if err := dial(t, newTestRouter(newDirect(healthy)), host); err != nil {
+				t.Fatalf("another direct connector inherited the refusal: %v", err)
+			}
+			if healthy.connects.Load() != 1 {
+				t.Fatal("healthy direct connector was not attempted")
+			}
+		})
+	}
+}
+
+func TestDirectFailoverTriesIndependentConnectors(t *testing.T) {
+	host := fmt.Sprintf("direct-failover-%d.example:443", time.Now().UnixNano())
+	failure := errors.New("first connector cannot reach destination")
+	broken := &refusingTransport{refused: map[string]error{host: failure}}
+	healthy := &refusingTransport{}
+	nodes := make([]*corechain.Node, 0, 2)
+	for _, transport := range []*refusingTransport{broken, healthy} {
+		nodes = append(nodes, corechain.NewNode("direct-fallback", "",
+			corechain.TransportNodeOption(transport),
+			corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct"}))))
+	}
+	router := newTestRouter(nodes...)
+	if err := dial(t, router, host); err != nil {
+		t.Fatalf("independent direct connector was excluded from failover: %v", err)
+	}
+	if broken.connects.Load() != 1 || healthy.connects.Load() != 1 {
+		t.Fatalf("direct attempts=%d/%d, want 1/1", broken.connects.Load(), healthy.connects.Load())
+	}
+}
+
+func TestProxyTransportFailuresStillCoolAndFailOver(t *testing.T) {
+	for _, stage := range []string{"dial", "authentication", "server_reply", "unsupported_command", "connect_timeout"} {
+		t.Run(stage, func(t *testing.T) {
+			broken := &refusingTransport{}
+			switch stage {
+			case "dial":
+				broken.dialErr = errors.New("proxy dial failed")
+			case "authentication":
+				broken.handshakeErr = errors.New("proxy authentication failed")
+			case "server_reply":
+				broken.refused = map[string]error{"target.example": socksReply(1)}
+			case "unsupported_command":
+				broken.refused = map[string]error{"target.example": socksReply(7)}
+			case "connect_timeout":
+				broken.refused = map[string]error{"target.example": context.DeadlineExceeded}
+			}
+			a := pineNode("er_broken_"+stage, broken)
+			b := pineNode("er_healthy_"+stage, &refusingTransport{})
+			r := newTestRouter(a, b)
+			if err := dial(t, r, "target.example:443"); err != nil {
+				t.Fatal(err)
+			}
+			if a.Marker().Count() != 1 {
+				t.Fatalf("proxy failure marker=%d, want 1", a.Marker().Count())
+			}
+		})
+	}
+}
+
+func TestCanceledRequestDoesNotDamageRouteHealth(t *testing.T) {
+	transport := &refusingTransport{cancelConnect: true}
+	node := pineNode("er_cancel", transport)
+	r := newTestRouter(node, pineNode("er_unused", &refusingTransport{}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	conn, err := r.Dial(ctx, "tcp", "target.example:443")
+	if conn != nil {
+		conn.Close()
+		t.Fatal("canceled request returned a connection")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || node.Marker().Count() != 0 {
+		t.Fatalf("cancel error=%v marker=%d", err, node.Marker().Count())
+	}
+}
+
+func TestRouterAttemptDeadlineStillCoolsProxy(t *testing.T) {
+	transport := &refusingTransport{cancelConnect: true}
+	node := pineNode("er_attempt_deadline", transport)
+	healthy := &refusingTransport{}
+	r := newTestRouter(node, pineNode("er_after_deadline", healthy))
+	r.Options().Timeout = 10 * time.Millisecond
+	if err := dial(t, r, "target.example:443"); err != nil {
+		t.Fatalf("per-route timeout did not fail over: %v", err)
+	}
+	if node.Marker().Count() != 1 || healthy.connects.Load() != 1 {
+		t.Fatalf("attempt timeout marker=%d, healthy attempts=%d", node.Marker().Count(), healthy.connects.Load())
+	}
+}
+
+func TestConcurrentBadDestinationCannotDisableHealthyTraffic(t *testing.T) {
+	host := fmt.Sprintf("parallel-%d.example", time.Now().UnixNano())
+	r := newTestRouter(
+		pineNode("er_a_"+host, &refusingTransport{refused: map[string]error{host: socksReply(4)}}),
+		pineNode("er_b_"+host, &refusingTransport{refused: map[string]error{host: socksReply(4)}}),
+	)
+	var wg sync.WaitGroup
+	for i := 0; i < 40; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			address := "healthy.example:443"
+			if i%2 == 0 {
+				address = host + ":443"
+			}
+			err := dial(t, r, address)
+			if (i%2 == 0) != (err != nil) {
+				t.Errorf("address=%s error=%v", address, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+}
+
+// A CONNECT-style error received while reaching an upstream hop is evidence
+// about that hop, not a refusal of the browser's destination.
+func TestUpstreamReplyDoesNotPoisonDestinationCache(t *testing.T) {
+	for _, stage := range []string{"dial", "handshake"} {
+		t.Run(stage, func(t *testing.T) {
+			host := fmt.Sprintf("upstream-%s-%d.example", stage, time.Now().UnixNano())
+			broken := &refusingTransport{}
+			if stage == "dial" {
+				broken.dialErr = socksReply(4)
+			} else {
+				broken.handshakeErr = socksReply(4)
+			}
+			healthy := &refusingTransport{}
+			primary := pineNode("er_primary_"+host, broken)
+			r := newTestRouter(primary, pineNode("er_backup_"+host, healthy))
+			if err := dial(t, r, host+":443"); err != nil {
+				t.Fatal(err)
+			}
+			if primary.Marker().Count() != 1 {
+				t.Fatal("upstream failure did not cool the proxy")
+			}
+			// Simulate the proxy recovering after its route cooldown. There
+			// must be no independent destination refusal left behind.
+			broken.dialErr, broken.handshakeErr = nil, nil
+			primary.Marker().Reset()
+			if err := dial(t, r, host+":443"); err != nil {
+				t.Fatal(err)
+			}
+			if broken.connects.Load() != 1 || healthy.connects.Load() != 1 {
+				t.Fatal("upstream failure was incorrectly cached against the destination")
+			}
+		})
 	}
 }

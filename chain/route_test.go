@@ -10,9 +10,41 @@ import (
 	corechain "github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
 	corehop "github.com/go-gost/core/hop"
+	"github.com/go-gost/x/internal/pineroute"
 	xlogger "github.com/go-gost/x/logger"
 	xselector "github.com/go-gost/x/selector"
 )
+
+type upstreamReplyError struct{}
+
+func (upstreamReplyError) Error() string          { return "upstream host unreachable" }
+func (upstreamReplyError) SOCKS5ReplyCode() uint8 { return 4 }
+
+func TestIntermediateProxyFailureStillMarksChainUnhealthy(t *testing.T) {
+	wasEnabled := pineroute.Enabled
+	pineroute.Enabled = true
+	defer func() { pineroute.Enabled = wasEnabled }()
+
+	first := corechain.NewNode("first", "first.example:1080",
+		corechain.TransportNodeOption(&testTransport{connectErr: upstreamReplyError{}}))
+	last := corechain.NewNode("last", "last.example:1080", corechain.TransportNodeOption(&testTransport{}))
+	chainer := NewChain("multi-hop")
+	chainer.AddHop(&testHop{nodes: []*corechain.Node{first}})
+	chainer.AddHop(&testHop{nodes: []*corechain.Node{last}})
+	ctx := pineroute.WithAttempts(context.Background())
+	route := chainer.Route(ctx, "tcp", "destination.example:443")
+	conn, err := route.Dial(ctx, "tcp", "destination.example:443", corechain.LoggerDialOption(xlogger.Nop()))
+	if conn != nil {
+		conn.Close()
+		t.Fatal("intermediate failure returned a connection")
+	}
+	if !errors.Is(err, upstreamReplyError{}) || pineroute.DestinationScoped("tcp", err) {
+		t.Fatalf("upstream failure lost its phase or identity: %v", err)
+	}
+	if chainer.Marker().Count() != 1 || last.Marker().Count() != 1 {
+		t.Fatalf("upstream failure did not affect chain health: chain=%d node=%d", chainer.Marker().Count(), last.Marker().Count())
+	}
+}
 
 func TestRouteMarksFinalNodeWhenConnectFails(t *testing.T) {
 	connectErr := errors.New("upstream rejected CONNECT")
