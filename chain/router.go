@@ -170,6 +170,11 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			node := path[len(path)-1]
 			pineroute.MarkTried(ctx, node)
 			pineroute.RecordRefusal(ctx, node, network, address, err)
+			if err == nil {
+				pineroute.BlameSuspects(ctx, node, network, ipAddr)
+			} else {
+				pineroute.NoteSuspect(ctx, node, network, address, ipAddr, err)
+			}
 		}
 		result := "success"
 		errorClass, socks5Reply := pineevent.ErrorDetails(err)

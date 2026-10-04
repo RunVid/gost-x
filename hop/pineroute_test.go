@@ -412,3 +412,180 @@ func TestUpstreamReplyDoesNotPoisonDestinationCache(t *testing.T) {
 		})
 	}
 }
+
+// everythingTransport answers every CONNECT with err, like a residential exit
+// that has lost connectivity but still completes the SOCKS handshake.
+type everythingTransport struct {
+	refusingTransport
+	err error
+}
+
+func (t *everythingTransport) Connect(_ context.Context, conn net.Conn, _, _ string) (net.Conn, error) {
+	t.connects.Add(1)
+	return conn, t.err
+}
+
+func (t *everythingTransport) Copy() corechain.Transporter { return t }
+
+// Mirrors pineroute.escalationHosts.
+const escalationHosts = 3
+
+// Production pattern 2026-10-04: one Oxylabs session answered reply 4 after
+// ~3 s for every host, so each new host on the Computer waited for it first.
+func TestRouteFailingReachableHostsIsQuarantined(t *testing.T) {
+	for _, reply := range []uint8{3, 4, 5, 6} {
+		t.Run(fmt.Sprint(reply), func(t *testing.T) {
+			id := fmt.Sprintf("%d-%d", reply, time.Now().UnixNano())
+			broken := &everythingTransport{err: socksReply(reply)}
+			second := &refusingTransport{}
+			primary := pineNode("er_broken_exit_"+id, broken)
+			r := newTestRouter(primary, pineNode("er_second_"+id, second), backupNode("er_fallback_"+id, &refusingTransport{}))
+
+			for i := 1; i <= escalationHosts; i++ {
+				if err := dial(t, r, fmt.Sprintf("site-%d-%s.example:443", i, id)); err != nil {
+					t.Fatalf("host %d did not fail over: %v", i, err)
+				}
+			}
+			if broken.connects.Load() != escalationHosts || primary.Marker().Count() != 0 {
+				t.Fatalf("primary connects=%d marker=%d before quarantine", broken.connects.Load(), primary.Marker().Count())
+			}
+			for i := 0; i < 5; i++ {
+				if err := dial(t, r, fmt.Sprintf("next-%d-%s.example:443", i, id)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if broken.connects.Load() != escalationHosts {
+				t.Fatal("quarantined route was still tried first for new hosts")
+			}
+			if second.connects.Load() != escalationHosts+5 {
+				t.Fatalf("second primary served %d, want %d", second.connects.Load(), escalationHosts+5)
+			}
+		})
+	}
+}
+
+func backupNode(id string, transport corechain.Transporter) *corechain.Node {
+	return corechain.NewNode(id, id+".example:1080",
+		corechain.TransportNodeOption(transport),
+		corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_id": id, "backup": true})))
+}
+
+// Production pattern 2026-10-02/03: dead trackers failed on every route. They
+// must not be charged to any route, or a page with a few of them would push
+// every route of the Computer out at once.
+func TestDestinationsNoRouteReachesAreNotCharged(t *testing.T) {
+	id := fmt.Sprint(time.Now().UnixNano())
+	dead := map[string]error{}
+	for i := 0; i < 6; i++ {
+		dead[fmt.Sprintf("dead-%d-%s.example", i, id)] = socksReply(4)
+	}
+	a := &refusingTransport{refused: dead}
+	r := newTestRouter(pineNode("er_primary_dead_"+id, a), pineNode("er_fallback_dead_"+id, &refusingTransport{refused: dead}))
+	for host := range dead {
+		if err := dial(t, r, host+":443"); err == nil {
+			t.Fatalf("dead host %s connected", host)
+		}
+	}
+	if err := dial(t, r, "healthy-"+id+".example:443"); err != nil {
+		t.Fatal(err)
+	}
+	if a.connects.Load() != int32(len(dead))+1 {
+		t.Fatal("healthy host did not use the primary")
+	}
+}
+
+// Provider policy refusals (ads, restricted targets) and address-family errors
+// are about the destination and never quarantine a route.
+func TestPolicyAndAddressFamilyRefusalsNeverQuarantine(t *testing.T) {
+	for _, reply := range []uint8{2, 8} {
+		t.Run(fmt.Sprint(reply), func(t *testing.T) {
+			id := fmt.Sprintf("%d-%d", reply, time.Now().UnixNano())
+			policy := &everythingTransport{err: socksReply(reply)}
+			r := newTestRouter(pineNode("er_policy_"+id, policy), pineNode("er_policy_backup_"+id, &refusingTransport{}))
+			for i := 0; i < 10; i++ {
+				if err := dial(t, r, fmt.Sprintf("ads-%d-%s.example:443", i, id)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if policy.connects.Load() != 10 {
+				t.Fatalf("route stopped being tried after reply %d refusals: %d", reply, policy.connects.Load())
+			}
+		})
+	}
+}
+
+// Repeated failures for one host are one piece of evidence, not three.
+func TestRepeatedHostDoesNotQuarantine(t *testing.T) {
+	id := fmt.Sprint(time.Now().UnixNano())
+	host := "flaky-" + id + ".example"
+	primary := &refusingTransport{refused: map[string]error{host: socksReply(4)}}
+	r := newTestRouter(pineNode("er_one_host_"+id, primary), pineNode("er_one_host_backup_"+id, &refusingTransport{}))
+	for _, port := range []string{"443", "8443", "9443", "10443"} {
+		if err := dial(t, r, host+":"+port); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := primary.connects.Load()
+	if err := dial(t, r, "other-"+id+".example:443"); err != nil {
+		t.Fatal(err)
+	}
+	if primary.connects.Load() != before+1 {
+		t.Fatal("one failing host quarantined the whole route")
+	}
+}
+
+// Routes with complementary reachability charge each other. Quarantine must
+// never leave a request without a route: when every route is quarantined,
+// selection falls back to the full set instead of failing closed.
+func TestComplementaryRoutesNeverBlackOut(t *testing.T) {
+	id := fmt.Sprint(time.Now().UnixNano())
+	aRefuses, bRefuses := map[string]error{}, map[string]error{}
+	for i := 0; i < 3; i++ {
+		aRefuses[fmt.Sprintf("a-%d-%s.example", i, id)] = socksReply(4)
+		bRefuses[fmt.Sprintf("b-%d-%s.example", i, id)] = socksReply(4)
+	}
+	a := &refusingTransport{refused: aRefuses}
+	b := &refusingTransport{refused: bRefuses}
+	r := newTestRouter(pineNode("er_comp_a_"+id, a), pineNode("er_comp_b_"+id, b))
+	var wg sync.WaitGroup
+	for _, hosts := range []map[string]error{aRefuses, bRefuses} {
+		for host := range hosts {
+			wg.Add(1)
+			go func(host string) {
+				defer wg.Done()
+				if err := dial(t, r, host+":443"); err != nil {
+					t.Errorf("%s: %v", host, err)
+				}
+			}(host)
+		}
+	}
+	wg.Wait()
+	for i := 0; i < 10; i++ {
+		if err := dial(t, r, fmt.Sprintf("shared-%d-%s.example:443", i, id)); err != nil {
+			t.Fatalf("quarantine blacked out the Computer: %v", err)
+		}
+	}
+}
+
+// Explicit-country plans have no direct node. A quarantined single route must
+// still be used rather than failing the request.
+func TestQuarantinedOnlyRouteIsStillUsed(t *testing.T) {
+	id := fmt.Sprint(time.Now().UnixNano())
+	refused := map[string]error{}
+	for i := 0; i < 3; i++ {
+		refused[fmt.Sprintf("only-%d-%s.example", i, id)] = socksReply(4)
+	}
+	only := &refusingTransport{refused: refused}
+	other := &refusingTransport{}
+	onlyNode := pineNode("er_only_"+id, only)
+	r := newTestRouter(onlyNode, pineNode("er_other_"+id, other))
+	for host := range refused {
+		if err := dial(t, r, host+":443"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	solo := newTestRouter(onlyNode)
+	if err := dial(t, solo, "solo-"+id+".example:443"); err != nil {
+		t.Fatalf("quarantined sole route was not used: %v", err)
+	}
+}

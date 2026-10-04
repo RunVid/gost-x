@@ -259,3 +259,141 @@ func TestOnlyTCPConnectNetworksAreDestinationScoped(t *testing.T) {
 		}
 	}
 }
+
+func TestEscalationNeedsDistinctHostsWithinWindow(t *testing.T) {
+	tracker := newEscalationTracker(8)
+	route := incarnation{id: "er_window", marker: pineNode("er_window").Marker()}
+	now := time.Now()
+	if tracker.charge(route, "a.example", now, now) || tracker.charge(route, "a.example", now, now) ||
+		tracker.charge(route, "b.example", now, now) {
+		t.Fatal("escalated before three distinct hosts")
+	}
+	if !tracker.charge(route, "c.example", now, now.Add(escalationWindow-time.Second)) {
+		t.Fatal("three distinct hosts inside the window did not escalate")
+	}
+	if tracker.charge(route, "d.example", now, now) {
+		t.Fatal("history survived an escalation")
+	}
+	spread := incarnation{id: "er_spread", marker: pineNode("er_spread").Marker()}
+	for i := 0; i < 5; i++ {
+		at := now.Add(time.Duration(i) * escalationWindow)
+		if tracker.charge(spread, fmt.Sprintf("h%d.example", i), at, at) {
+			t.Fatal("hosts spread beyond the window escalated")
+		}
+	}
+}
+
+func TestDelayedAttributionUsesFailureTime(t *testing.T) {
+	tracker := newEscalationTracker(8)
+	route := incarnation{id: "er_delayed", marker: pineNode("er_delayed").Marker()}
+	now := time.Now()
+	old := now.Add(-escalationWindow - time.Second)
+	for i, host := range []string{"a.example", "b.example", "c.example"} {
+		if tracker.charge(route, host, old.Add(time.Duration(i)*time.Millisecond), now) {
+			t.Fatal("failures older than the window escalated when charged late")
+		}
+	}
+	// Out-of-order arrival inside the window still counts once per host.
+	if tracker.charge(route, "x.example", now.Add(-time.Second), now) ||
+		tracker.charge(route, "y.example", now.Add(-2*time.Second), now) ||
+		!tracker.charge(route, "z.example", now.Add(-3*time.Second), now) {
+		t.Fatal("out-of-order failures inside the window were not counted")
+	}
+}
+
+func TestEscalationTrackerAndQuarantineStayBounded(t *testing.T) {
+	tracker := newEscalationTracker(4)
+	q := newQuarantine(4)
+	var wg sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				route := incarnation{id: fmt.Sprintf("er_%d_%d", worker, i), marker: pineNode("m").Marker()}
+				tracker.charge(route, "h.example", time.Now(), time.Now())
+				q.add(route, time.Now())
+				q.contains(route, time.Now())
+			}
+		}(worker)
+	}
+	wg.Wait()
+	if len(tracker.routes) > 4 || len(q.entries) > 4 {
+		t.Fatalf("bounds exceeded: tracker=%d quarantine=%d", len(tracker.routes), len(q.entries))
+	}
+}
+
+func TestQuarantineExpiresAndFollowsIncarnation(t *testing.T) {
+	q := newQuarantine(8)
+	loaded := pineNode("er_reload")
+	route, _ := managedIncarnation(loaded)
+	copied, _ := managedIncarnation(loaded.Copy())
+	reloaded, _ := managedIncarnation(pineNode("er_reload"))
+	now := time.Now()
+	q.add(route, now)
+	if !q.contains(copied, now) {
+		t.Fatal("node copy lost its quarantine")
+	}
+	if q.contains(reloaded, now) {
+		t.Fatal("a reloaded route inherited its predecessor's quarantine")
+	}
+	if q.contains(route, now.Add(quarantineTTL)) {
+		t.Fatal("quarantine did not expire")
+	}
+}
+
+func TestSuspectsRequireSameDialedAddressAndLiveRequest(t *testing.T) {
+	ctx := WithAttempts(context.Background())
+	failed := pineNode("er_suspect_dns")
+	winner := pineNode("er_suspect_winner")
+	for i := 0; i < 5; i++ {
+		address := fmt.Sprintf("multi-%d.example:443", i)
+		ctx := WithAttempts(context.Background())
+		NoteSuspect(ctx, failed, "tcp", address, "192.0.2.1:443", replyError(4))
+		BlameSuspects(ctx, winner, "tcp", "198.51.100.1:443")
+	}
+	if WithoutQuarantined([]*chain.Node{failed, winner}) != nil {
+		t.Fatal("a route was charged for a different resolved address")
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	tracked := WithAttempts(canceled)
+	for i := 0; i < 5; i++ {
+		NoteSuspect(tracked, failed, "tcp", fmt.Sprintf("c%d.example:443", i), "c:443", replyError(4))
+	}
+	cancel()
+	BlameSuspects(tracked, winner, "tcp", "c:443")
+	if WithoutQuarantined([]*chain.Node{failed, winner}) != nil {
+		t.Fatal("a canceled request charged its suspects")
+	}
+	BlameSuspects(ctx, nil, "tcp", "x:443")
+}
+
+func TestOnlyManagedTransientRepliesBecomeSuspects(t *testing.T) {
+	direct := chain.NewNode("direct", "", chain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct"})))
+	unnamed := chain.NewNode("unnamed", "proxy.example:1080")
+	route := pineNode("er_classes")
+	cases := map[string]struct {
+		node *chain.Node
+		err  error
+	}{
+		"policy":         {route, replyError(2)},
+		"address family": {route, replyError(8)},
+		"general":        {route, replyError(1)},
+		"upstream":       {route, UpstreamFailure(replyError(4))},
+		"direct":         {direct, replyError(4)},
+		"unnamed":        {unnamed, replyError(4)},
+	}
+	for name, tc := range cases {
+		ctx := WithAttempts(context.Background())
+		NoteSuspect(ctx, tc.node, "tcp", "x.example:443", "x.example:443", tc.err)
+		if a := ctx.Value(attemptsKey{}).(*attempts); len(a.suspects) != 0 {
+			t.Errorf("%s became a suspect", name)
+		}
+	}
+	ctx := WithAttempts(context.Background())
+	NoteSuspect(ctx, route, "tcp", "x.example:443", "x.example:443", replyError(4))
+	NoteSuspect(ctx, route, "udp", "x.example:443", "x.example:443", replyError(4))
+	if a := ctx.Value(attemptsKey{}).(*attempts); len(a.suspects) != 1 {
+		t.Fatalf("suspects=%d, want only the TCP host-unreachable", len(a.suspects))
+	}
+}

@@ -181,6 +181,15 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 
 		nodes = append(nodes, node)
 	}
+	if preferred := pineroute.WithoutQuarantined(nodes); len(preferred) > 0 {
+		if node := p.selectNode(ctx, preferred); node != nil {
+			return node
+		}
+	}
+	return p.selectNode(ctx, nodes)
+}
+
+func (p *chainHop) selectNode(ctx context.Context, nodes []*chain.Node) *chain.Node {
 	if len(nodes) == 0 {
 		return nil
 	}
