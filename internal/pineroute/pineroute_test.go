@@ -72,18 +72,18 @@ func TestSkipTracksTriedNodesPerRequest(t *testing.T) {
 func TestRefusalCacheScopesByNodeAndHost(t *testing.T) {
 	cache := newRefusalCache(8)
 	now := time.Unix(1_700_000_000, 0)
-	cache.add("route-a", "tcp", "Accounts.Google.com.:443", time.Minute, now)
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "Accounts.Google.com.:443", time.Minute, now)
 
-	if !cache.contains("route-a", "tcp", "accounts.google.com:443", now) {
+	if !cache.contains(routeKey{managedID: "route-a"}, "tcp", "accounts.google.com:443", now) {
 		t.Fatal("refused host was not remembered")
 	}
-	if cache.contains("route-a", "tcp", "example.com:443", now) {
+	if cache.contains(routeKey{managedID: "route-a"}, "tcp", "example.com:443", now) {
 		t.Fatal("refusal spread to another host")
 	}
-	if cache.contains("route-b", "tcp", "accounts.google.com:443", now) {
+	if cache.contains(routeKey{managedID: "route-b"}, "tcp", "accounts.google.com:443", now) {
 		t.Fatal("refusal spread to another route")
 	}
-	if cache.contains("route-a", "tcp", "accounts.google.com:443", now.Add(time.Minute)) {
+	if cache.contains(routeKey{managedID: "route-a"}, "tcp", "accounts.google.com:443", now.Add(time.Minute)) {
 		t.Fatal("refusal outlived its TTL")
 	}
 }
@@ -92,20 +92,20 @@ func TestRefusalCacheStaysBounded(t *testing.T) {
 	cache := newRefusalCache(4)
 	now := time.Unix(1_700_000_000, 0)
 	for i := 0; i < 10; i++ {
-		cache.add("route-a", "tcp", fmt.Sprintf("host-%d.example:443", i), time.Hour, now)
+		cache.add(routeKey{managedID: "route-a"}, "tcp", fmt.Sprintf("host-%d.example:443", i), time.Hour, now)
 	}
 	if len(cache.entries) > 4 {
 		t.Fatalf("cache holds %d entries, want at most 4", len(cache.entries))
 	}
 
 	cache = newRefusalCache(2)
-	cache.add("route-a", "tcp", "old.example:443", time.Hour, now)
-	cache.add("route-a", "tcp", "kept.example:443", time.Hour, now.Add(time.Minute))
-	cache.add("route-a", "tcp", "new.example:443", time.Hour, now.Add(2*time.Minute))
-	if cache.contains("route-a", "tcp", "old.example:443", now.Add(2*time.Minute)) {
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "old.example:443", time.Hour, now)
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "kept.example:443", time.Hour, now.Add(time.Minute))
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "new.example:443", time.Hour, now.Add(2*time.Minute))
+	if cache.contains(routeKey{managedID: "route-a"}, "tcp", "old.example:443", now.Add(2*time.Minute)) {
 		t.Fatal("a full cache kept its oldest refusal")
 	}
-	if !cache.contains("route-a", "tcp", "kept.example:443", now.Add(2*time.Minute)) {
+	if !cache.contains(routeKey{managedID: "route-a"}, "tcp", "kept.example:443", now.Add(2*time.Minute)) {
 		t.Fatal("a full cache dropped a newer live refusal")
 	}
 }
@@ -144,24 +144,24 @@ func TestDestinationReplyClassification(t *testing.T) {
 func TestRefusalCacheSeparatesPortsNetworksAndIPFamilies(t *testing.T) {
 	cache := newRefusalCache(8)
 	now := time.Now()
-	cache.add("route", "tcp", "Example.COM.:0443", time.Minute, now)
-	if !cache.contains("route", "tcp", "example.com:443", now) {
+	cache.add(routeKey{managedID: "route"}, "tcp", "Example.COM.:0443", time.Minute, now)
+	if !cache.contains(routeKey{managedID: "route"}, "tcp", "example.com:443", now) {
 		t.Fatal("equivalent hostname/port did not match")
 	}
 	for _, endpoint := range []struct{ network, address string }{
 		{"tcp", "example.com:80"}, {"tcp4", "example.com:443"}, {"tcp6", "example.com:443"},
 	} {
-		if cache.contains("route", endpoint.network, endpoint.address, now) {
+		if cache.contains(routeKey{managedID: "route"}, endpoint.network, endpoint.address, now) {
 			t.Fatalf("refusal crossed endpoint boundary: %+v", endpoint)
 		}
 	}
-	cache.add("route", "tcp", "[2001:0db8::1]:443", time.Minute, now)
-	if !cache.contains("route", "tcp", "[2001:db8::1]:443", now) {
+	cache.add(routeKey{managedID: "route"}, "tcp", "[2001:0db8::1]:443", time.Minute, now)
+	if !cache.contains(routeKey{managedID: "route"}, "tcp", "[2001:db8::1]:443", now) {
 		t.Fatal("equivalent IPv6 address did not match")
 	}
 	for _, address := range []string{"", "example.com", ":443", "example.com:0", "example.com:65536"} {
-		cache.add("invalid", "tcp", address, time.Minute, now)
-		if cache.contains("invalid", "tcp", address, now) {
+		cache.add(routeKey{managedID: "invalid"}, "tcp", address, time.Minute, now)
+		if cache.contains(routeKey{managedID: "invalid"}, "tcp", address, now) {
 			t.Fatalf("invalid endpoint cached: %q", address)
 		}
 	}
@@ -170,11 +170,11 @@ func TestRefusalCacheSeparatesPortsNetworksAndIPFamilies(t *testing.T) {
 func TestTransientRefusalExpiresWithoutSlidingOnReads(t *testing.T) {
 	cache := newRefusalCache(8)
 	now := time.Now()
-	cache.add("route", "tcp", "gone.example:443", transientTTL, now)
-	if !cache.contains("route", "tcp", "gone.example:443", now.Add(transientTTL-time.Nanosecond)) {
+	cache.add(routeKey{managedID: "route"}, "tcp", "gone.example:443", transientTTL, now)
+	if !cache.contains(routeKey{managedID: "route"}, "tcp", "gone.example:443", now.Add(transientTTL-time.Nanosecond)) {
 		t.Fatal("transient refusal expired too early")
 	}
-	if cache.contains("route", "tcp", "gone.example:443", now.Add(transientTTL)) {
+	if cache.contains(routeKey{managedID: "route"}, "tcp", "gone.example:443", now.Add(transientTTL)) {
 		t.Fatal("cache reads prolonged a transient refusal")
 	}
 }
@@ -218,8 +218,8 @@ func TestRefusalCacheConcurrentChurn(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
 				address := fmt.Sprintf("host-%d-%d.example:443", worker, i)
-				cache.add("route", "tcp", address, transientTTL, time.Now())
-				cache.contains("route", "tcp", address, time.Now())
+				cache.add(routeKey{managedID: "route"}, "tcp", address, transientTTL, time.Now())
+				cache.contains(routeKey{managedID: "route"}, "tcp", address, time.Now())
 			}
 		}(worker)
 	}

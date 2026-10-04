@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/selector"
 )
 
 const (
@@ -114,27 +115,36 @@ func RequestCanceled(ctx context.Context, err error) bool {
 	return request.Err() != nil || errors.Is(err, context.Canceled)
 }
 
-func routeID(node *chain.Node) string {
+// routeKey follows the connector's lifetime. Managed routes have a stable ID
+// assigned by Pine. Direct nodes use the marker created by chain.NewNode:
+// Node.Copy preserves it, while a separately loaded connector gets a new one.
+// Retaining that identity in the bounded cache also prevents pointer reuse;
+// neither names nor formatted pointer addresses are sufficient cache keys.
+type routeKey struct {
+	managedID string
+	direct    selector.Marker
+}
+
+func nodeRouteKey(node *chain.Node) routeKey {
 	if node == nil {
-		return ""
+		return routeKey{}
 	}
 	if IsDirect(node) {
-		// Only an in-memory key. Never emitted as a provider route ID.
-		return "@direct"
+		return routeKey{direct: node.Marker()}
 	}
 	md := node.Options().Metadata
 	if md == nil {
-		return ""
+		return routeKey{}
 	}
 	id, _ := md.Get("pine_route_id").(string)
-	return id
+	return routeKey{managedID: id}
 }
 
 type attemptsKey struct{}
 
 type attempts struct {
 	mu      sync.Mutex
-	tried   map[string]struct{}
+	tried   map[routeKey]struct{}
 	request context.Context
 }
 
@@ -145,7 +155,7 @@ func WithAttempts(ctx context.Context) context.Context {
 	if !Enabled {
 		return ctx
 	}
-	return context.WithValue(ctx, attemptsKey{}, &attempts{tried: map[string]struct{}{}, request: ctx})
+	return context.WithValue(ctx, attemptsKey{}, &attempts{tried: map[routeKey]struct{}{}, request: ctx})
 }
 
 // Tracking reports whether ctx belongs to a request that tracks attempts.
@@ -157,8 +167,8 @@ func Tracking(ctx context.Context) bool {
 // MarkTried records that node was attempted by the request in ctx.
 func MarkTried(ctx context.Context, node *chain.Node) {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
-	id := routeID(node)
-	if a == nil || id == "" {
+	id := nodeRouteKey(node)
+	if a == nil || id == (routeKey{}) {
 		return
 	}
 	a.mu.Lock()
@@ -166,7 +176,7 @@ func MarkTried(ctx context.Context, node *chain.Node) {
 	a.mu.Unlock()
 }
 
-func tried(ctx context.Context, id string) bool {
+func tried(ctx context.Context, id routeKey) bool {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
 	if a == nil {
 		return false
@@ -177,11 +187,11 @@ func tried(ctx context.Context, id string) bool {
 	return ok
 }
 
-// Skip reports whether node should not be selected for host in ctx: it was
-// already tried by this request, or it refused this host recently.
+// Skip reports whether node should not be selected: it was already tried by
+// this request, or this connector refused the network/endpoint recently.
 func Skip(ctx context.Context, node *chain.Node, network, address string) bool {
-	id := routeID(node)
-	if id == "" || !Tracking(ctx) {
+	id := nodeRouteKey(node)
+	if id == (routeKey{}) || !Tracking(ctx) {
 		return false
 	}
 	return tried(ctx, id) || defaultRefusals.contains(id, network, address, time.Now())
@@ -198,53 +208,60 @@ func RecordRefusal(ctx context.Context, node *chain.Node, network, address strin
 	if errors.As(err, &reply) && reply.SOCKS5ReplyCode() == replyNotAllowed {
 		ttl = refusalTTL
 	}
-	if id := routeID(node); id != "" {
+	if id := nodeRouteKey(node); id != (routeKey{}) {
 		defaultRefusals.add(id, network, address, ttl, time.Now())
 	}
 }
 
 type refusalCache struct {
 	mu      sync.Mutex
-	entries map[string]time.Time
+	entries map[endpointKey]time.Time
 	limit   int
+}
+
+type endpointKey struct {
+	route   routeKey
+	network string
+	address string
 }
 
 var defaultRefusals = newRefusalCache(refusalCacheLimit)
 
 func newRefusalCache(limit int) *refusalCache {
-	return &refusalCache{entries: map[string]time.Time{}, limit: limit}
+	return &refusalCache{entries: map[endpointKey]time.Time{}, limit: limit}
 }
 
-func refusalKey(routeID, network, address string) (string, bool) {
+func refusalKey(route routeKey, network, address string) (endpointKey, bool) {
 	host, port, err := net.SplitHostPort(address)
 	p, portErr := strconv.ParseUint(port, 10, 16)
-	if routeID == "" || host == "" || err != nil || portErr != nil || p == 0 ||
+	if route == (routeKey{}) || host == "" || err != nil || portErr != nil || p == 0 ||
 		!tcpNetwork(network) {
-		return "", false
+		return endpointKey{}, false
 	}
 	if ip, err := netip.ParseAddr(host); err == nil {
 		host = ip.String()
 	} else {
 		host = strings.ToLower(strings.TrimSuffix(host, "."))
 	}
-	return routeID + "\x00" + network + "\x00" + net.JoinHostPort(host, strconv.FormatUint(p, 10)), true
+	return endpointKey{route: route, network: network, address: net.JoinHostPort(host, strconv.FormatUint(p, 10))}, true
 }
 
-func (c *refusalCache) add(routeID, network, address string, ttl time.Duration, now time.Time) {
-	key, ok := refusalKey(routeID, network, address)
+func (c *refusalCache) add(route routeKey, network, address string, ttl time.Duration, now time.Time) {
+	key, ok := refusalKey(route, network, address)
 	if !ok || c.limit <= 0 || ttl <= 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.entries[key]; !ok && len(c.entries) >= c.limit {
-		oldestKey, oldest := "", time.Time{}
+		var oldestKey endpointKey
+		var oldest time.Time
 		for k, expires := range c.entries {
 			if !now.Before(expires) {
 				delete(c.entries, k)
 				continue
 			}
-			if oldestKey == "" || expires.Before(oldest) {
+			if oldest.IsZero() || expires.Before(oldest) {
 				oldestKey, oldest = k, expires
 			}
 		}
@@ -255,8 +272,8 @@ func (c *refusalCache) add(routeID, network, address string, ttl time.Duration, 
 	c.entries[key] = now.Add(ttl)
 }
 
-func (c *refusalCache) contains(routeID, network, address string, now time.Time) bool {
-	key, ok := refusalKey(routeID, network, address)
+func (c *refusalCache) contains(route routeKey, network, address string, now time.Time) bool {
+	key, ok := refusalKey(route, network, address)
 	if !ok {
 		return false
 	}

@@ -238,6 +238,63 @@ func TestDirectDestinationFailureDoesNotCoolFallback(t *testing.T) {
 	}
 }
 
+func TestDirectRefusalDoesNotCrossRouterOrReloadBoundary(t *testing.T) {
+	host := fmt.Sprintf("independent-direct-%d.example:443", time.Now().UnixNano())
+	failure := errors.New("destination unavailable on this direct connector")
+	newDirect := func(transport *refusingTransport) *corechain.Node {
+		// Names and metadata intentionally match, as independently loaded
+		// Pine configurations use the same direct-fallback name.
+		return corechain.NewNode("direct-fallback", "",
+			corechain.TransportNodeOption(transport),
+			corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct"})))
+	}
+	broken := &refusingTransport{refused: map[string]error{host: failure}}
+	brokenNode := newDirect(broken)
+	brokenRouter := newTestRouter(brokenNode)
+	if err := dial(t, brokenRouter, host); !errors.Is(err, failure) {
+		t.Fatalf("initial direct failure=%v, want %v", err, failure)
+	}
+	if err := dial(t, brokenRouter, host); !errors.Is(err, pineroute.ErrNoRoute) || broken.connects.Load() != 1 {
+		t.Fatalf("same connector lost its refusal cache: err=%v attempts=%d", err, broken.connects.Load())
+	}
+	// GOST can copy nodes while constructing multiplexed routes. Copies of
+	// one connector must keep its identity instead of bypassing the cache.
+	if err := dial(t, newTestRouter(brokenNode.Copy()), host); !errors.Is(err, pineroute.ErrNoRoute) {
+		t.Fatalf("a node copy bypassed its connector's refusal: %v", err)
+	}
+	for _, name := range []string{"independent router", "replacement after reload"} {
+		t.Run(name, func(t *testing.T) {
+			healthy := &refusingTransport{}
+			if err := dial(t, newTestRouter(newDirect(healthy)), host); err != nil {
+				t.Fatalf("another direct connector inherited the refusal: %v", err)
+			}
+			if healthy.connects.Load() != 1 {
+				t.Fatal("healthy direct connector was not attempted")
+			}
+		})
+	}
+}
+
+func TestDirectFailoverTriesIndependentConnectors(t *testing.T) {
+	host := fmt.Sprintf("direct-failover-%d.example:443", time.Now().UnixNano())
+	failure := errors.New("first connector cannot reach destination")
+	broken := &refusingTransport{refused: map[string]error{host: failure}}
+	healthy := &refusingTransport{}
+	nodes := make([]*corechain.Node, 0, 2)
+	for _, transport := range []*refusingTransport{broken, healthy} {
+		nodes = append(nodes, corechain.NewNode("direct-fallback", "",
+			corechain.TransportNodeOption(transport),
+			corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct"}))))
+	}
+	router := newTestRouter(nodes...)
+	if err := dial(t, router, host); err != nil {
+		t.Fatalf("independent direct connector was excluded from failover: %v", err)
+	}
+	if broken.connects.Load() != 1 || healthy.connects.Load() != 1 {
+		t.Fatalf("direct attempts=%d/%d, want 1/1", broken.connects.Load(), healthy.connects.Load())
+	}
+}
+
 func TestProxyTransportFailuresStillCoolAndFailOver(t *testing.T) {
 	for _, stage := range []string{"dial", "authentication", "server_reply", "unsupported_command", "connect_timeout"} {
 		t.Run(stage, func(t *testing.T) {
