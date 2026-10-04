@@ -181,7 +181,10 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 
 		nodes = append(nodes, node)
 	}
-	if preferred := pineroute.WithoutQuarantined(nodes); len(preferred) > 0 {
+	// Selection skips the selector's filters for a single candidate, so a
+	// lone preferred node is taken only if it has no recorded failure.
+	if preferred := pineroute.WithoutQuarantined(nodes); len(preferred) > 1 ||
+		len(preferred) == 1 && preferred[0].Marker().Count() == 0 {
 		if node := p.selectNode(ctx, preferred); node != nil {
 			return node
 		}

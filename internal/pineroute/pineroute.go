@@ -400,7 +400,7 @@ func WithoutQuarantined(nodes []*chain.Node) []*chain.Node {
 		return nil
 	}
 	now := time.Now()
-	var kept []*chain.Node
+	kept := make([]*chain.Node, 0, len(nodes))
 	excluded := false
 	for _, node := range nodes {
 		if route, ok := managedIncarnation(node); ok && defaultQuarantine.contains(route, now) {
@@ -460,9 +460,16 @@ func (t *escalationTracker) charge(route incarnation, host string, failedAt, now
 	}
 	recent := make([]hostSeen, 0, len(seen)+1)
 	for _, h := range seen {
-		if now.Sub(h.at) < escalationWindow && h.host != host {
-			recent = append(recent, h)
+		if now.Sub(h.at) >= escalationWindow {
+			continue
 		}
+		if h.host == host {
+			if h.at.After(failedAt) {
+				failedAt = h.at
+			}
+			continue
+		}
+		recent = append(recent, h)
 	}
 	recent = append(recent, hostSeen{host: host, at: failedAt})
 	if len(recent) >= escalationHosts {

@@ -397,3 +397,15 @@ func TestOnlyManagedTransientRepliesBecomeSuspects(t *testing.T) {
 		t.Fatalf("suspects=%d, want only the TCP host-unreachable", len(a.suspects))
 	}
 }
+
+func TestOlderDuplicateDoesNotReplaceNewerEvidence(t *testing.T) {
+	tracker := newEscalationTracker(8)
+	route := incarnation{id: "er_dup", marker: pineNode("er_dup").Marker()}
+	base := time.Now()
+	tracker.charge(route, "a.example", base.Add(25*time.Second), base.Add(25*time.Second))
+	tracker.charge(route, "a.example", base.Add(1*time.Second), base.Add(26*time.Second))
+	tracker.charge(route, "b.example", base.Add(31*time.Second), base.Add(31*time.Second))
+	if !tracker.charge(route, "c.example", base.Add(32*time.Second), base.Add(32*time.Second)) {
+		t.Fatal("a late duplicate erased newer evidence for the same host")
+	}
+}
