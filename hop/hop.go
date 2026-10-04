@@ -150,7 +150,7 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		if node == nil {
 			continue
 		}
-		if pineroute.Skip(ctx, node, options.Host) {
+		if pineroute.Skip(ctx, node, options.Network, options.Host) {
 			continue
 		}
 		// node level bypass

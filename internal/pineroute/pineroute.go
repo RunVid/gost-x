@@ -1,18 +1,17 @@
 // Package pineroute keeps destination-scoped route state for Pine egress.
 //
-// A SOCKS5 CONNECT reply "not allowed by ruleset" is about one destination,
-// not about the proxy route. Marking the route failed for such a reply puts it
-// into cooldown for every destination, and a page with many refused hosts can
-// put every route of a Computer into cooldown at once. Instead, the refused
-// route is skipped for the rest of the request and, for a short time, for
-// later requests to the same host.
+// Destination failures must not put a shared proxy or the explicit direct
+// fallback into cooldown for unrelated sites. They exclude only that route
+// for the current request and briefly for the same network/host/port.
 package pineroute
 
 import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +23,7 @@ const (
 	replyNotAllowed = 2
 
 	refusalTTL        = 10 * time.Minute
+	transientTTL      = 30 * time.Second
 	refusalCacheLimit = 4096
 )
 
@@ -39,19 +39,88 @@ type socks5ReplyError interface {
 // upstream behaviour.
 var Enabled = os.Getenv("PINE_GOST_EVENT_SOCKET") != ""
 
+// UpstreamFailure retains the phase in which a route failed. A SOCKS reply
+// received while reaching another proxy must not be cached against the final
+// destination. Preserve error identity for callers and telemetry.
+func UpstreamFailure(err error) error {
+	if !Enabled || err == nil {
+		return err
+	}
+	return upstreamFailure{err}
+}
+
+type upstreamFailure struct{ error }
+
+func (e upstreamFailure) Unwrap() error { return e.error }
+
+func isUpstreamFailure(err error) bool {
+	var upstream upstreamFailure
+	return errors.As(err, &upstream)
+}
+
+func tcpNetwork(network string) bool {
+	return network == "tcp" || network == "tcp4" || network == "tcp6"
+}
+
 // DestinationScoped reports whether err from a TCP CONNECT is a refusal that
 // concerns the destination rather than the health of the proxy route.
 func DestinationScoped(network string, err error) bool {
-	if !Enabled || !strings.HasPrefix(network, "tcp") {
+	if !Enabled || !tcpNetwork(network) || isUpstreamFailure(err) {
 		return false
 	}
 	var reply socks5ReplyError
-	return errors.As(err, &reply) && reply.SOCKS5ReplyCode() == replyNotAllowed
+	if !errors.As(err, &reply) {
+		return false
+	}
+	switch reply.SOCKS5ReplyCode() {
+	case 2, 3, 4, 5, 6, 8:
+		// Policy, network/host reachability, refusal, TTL and address-family
+		// errors concern this destination. General server failure (1), an
+		// unsupported CONNECT command (7), unknown replies and transport or
+		// authentication failures still count against the shared route.
+		return true
+	}
+	return false
+}
+
+// IsDirect identifies Pine's explicitly configured direct connector. An empty
+// chain is deliberately not direct: it must fail closed in the router.
+func IsDirect(node *chain.Node) bool {
+	if node == nil || node.Options().Metadata == nil {
+		return false
+	}
+	kind, _ := node.Options().Metadata.Get("pine_route_kind").(string)
+	return kind == "direct"
+}
+
+// IgnoreFailure distinguishes request/destination failures from route health.
+// For direct connectors, final Connect is the destination dial itself; there
+// is no upstream proxy whose shared health could be inferred from its error.
+func IgnoreFailure(ctx context.Context, node *chain.Node, network string, err error) bool {
+	return Enabled && err != nil && (RequestCanceled(ctx, err) ||
+		!isUpstreamFailure(err) && (DestinationScoped(network, err) || IsDirect(node) && tcpNetwork(network)))
+}
+
+// RequestCanceled excludes caller cancellation, not the router's own per-route
+// timeout. A slow proxy must still enter cooldown when its attempt expires.
+func RequestCanceled(ctx context.Context, err error) bool {
+	if !Enabled || err == nil {
+		return false
+	}
+	request := ctx
+	if a, _ := ctx.Value(attemptsKey{}).(*attempts); a != nil {
+		request = a.request
+	}
+	return request.Err() != nil || errors.Is(err, context.Canceled)
 }
 
 func routeID(node *chain.Node) string {
 	if node == nil {
 		return ""
+	}
+	if IsDirect(node) {
+		// Only an in-memory key. Never emitted as a provider route ID.
+		return "@direct"
 	}
 	md := node.Options().Metadata
 	if md == nil {
@@ -64,8 +133,9 @@ func routeID(node *chain.Node) string {
 type attemptsKey struct{}
 
 type attempts struct {
-	mu    sync.Mutex
-	tried map[string]struct{}
+	mu      sync.Mutex
+	tried   map[string]struct{}
+	request context.Context
 }
 
 // WithAttempts returns a context that tracks the routes tried by one router
@@ -75,7 +145,7 @@ func WithAttempts(ctx context.Context) context.Context {
 	if !Enabled {
 		return ctx
 	}
-	return context.WithValue(ctx, attemptsKey{}, &attempts{tried: map[string]struct{}{}})
+	return context.WithValue(ctx, attemptsKey{}, &attempts{tried: map[string]struct{}{}, request: ctx})
 }
 
 // Tracking reports whether ctx belongs to a request that tracks attempts.
@@ -109,52 +179,60 @@ func tried(ctx context.Context, id string) bool {
 
 // Skip reports whether node should not be selected for host in ctx: it was
 // already tried by this request, or it refused this host recently.
-func Skip(ctx context.Context, node *chain.Node, host string) bool {
+func Skip(ctx context.Context, node *chain.Node, network, address string) bool {
 	id := routeID(node)
 	if id == "" || !Tracking(ctx) {
 		return false
 	}
-	return tried(ctx, id) || defaultRefusals.contains(id, host, time.Now())
+	return tried(ctx, id) || defaultRefusals.contains(id, network, address, time.Now())
 }
 
-// RecordRefusal remembers that node refused host.
-func RecordRefusal(node *chain.Node, host string) {
+// RecordRefusal remembers a destination failure. Cancellation is not cached.
+// Transient failures recover quickly; repeated cache hits never renew a TTL.
+func RecordRefusal(ctx context.Context, node *chain.Node, network, address string, err error) {
+	if !IgnoreFailure(ctx, node, network, err) || RequestCanceled(ctx, err) {
+		return
+	}
+	ttl := transientTTL
+	var reply socks5ReplyError
+	if errors.As(err, &reply) && reply.SOCKS5ReplyCode() == replyNotAllowed {
+		ttl = refusalTTL
+	}
 	if id := routeID(node); id != "" {
-		defaultRefusals.add(id, host, time.Now())
+		defaultRefusals.add(id, network, address, ttl, time.Now())
 	}
 }
 
 type refusalCache struct {
 	mu      sync.Mutex
 	entries map[string]time.Time
-	ttl     time.Duration
 	limit   int
 }
 
-var defaultRefusals = newRefusalCache(refusalTTL, refusalCacheLimit)
+var defaultRefusals = newRefusalCache(refusalCacheLimit)
 
-func newRefusalCache(ttl time.Duration, limit int) *refusalCache {
-	return &refusalCache{entries: map[string]time.Time{}, ttl: ttl, limit: limit}
+func newRefusalCache(limit int) *refusalCache {
+	return &refusalCache{entries: map[string]time.Time{}, limit: limit}
 }
 
-func refusalKey(routeID, host string) (string, bool) {
-	host = normalizeHost(host)
-	if routeID == "" || host == "" {
+func refusalKey(routeID, network, address string) (string, bool) {
+	host, port, err := net.SplitHostPort(address)
+	p, portErr := strconv.ParseUint(port, 10, 16)
+	if routeID == "" || host == "" || err != nil || portErr != nil || p == 0 ||
+		!tcpNetwork(network) {
 		return "", false
 	}
-	return routeID + "\x00" + host, true
-}
-
-func normalizeHost(host string) string {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	if ip, err := netip.ParseAddr(host); err == nil {
+		host = ip.String()
+	} else {
+		host = strings.ToLower(strings.TrimSuffix(host, "."))
 	}
-	return strings.ToLower(strings.TrimSuffix(host, "."))
+	return routeID + "\x00" + network + "\x00" + net.JoinHostPort(host, strconv.FormatUint(p, 10)), true
 }
 
-func (c *refusalCache) add(routeID, host string, now time.Time) {
-	key, ok := refusalKey(routeID, host)
-	if !ok {
+func (c *refusalCache) add(routeID, network, address string, ttl time.Duration, now time.Time) {
+	key, ok := refusalKey(routeID, network, address)
+	if !ok || c.limit <= 0 || ttl <= 0 {
 		return
 	}
 	c.mu.Lock()
@@ -174,11 +252,11 @@ func (c *refusalCache) add(routeID, host string, now time.Time) {
 			delete(c.entries, oldestKey)
 		}
 	}
-	c.entries[key] = now.Add(c.ttl)
+	c.entries[key] = now.Add(ttl)
 }
 
-func (c *refusalCache) contains(routeID, host string, now time.Time) bool {
-	key, ok := refusalKey(routeID, host)
+func (c *refusalCache) contains(routeID, network, address string, now time.Time) bool {
+	key, ok := refusalKey(routeID, network, address)
 	if !ok {
 		return false
 	}

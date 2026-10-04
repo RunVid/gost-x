@@ -1,0 +1,33 @@
+name: Pine route contracts
+
+on:
+  pull_request:
+    branches: [pine/v0.8.1]
+  push:
+    branches: [pine/v0.8.1]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.25.x', '1.26.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Format
+        run: test -z "$(gofmt -l chain hop internal/pineroute sd/plugin/http.go)"
+      - name: Vet
+        run: go vet ./...
+      - name: Race tests
+        run: go test -race -count=1 -timeout=5m ./...
+      - name: Repeat routing contracts
+        run: go test -race -count=20 -timeout=5m ./chain ./hop ./internal/pineroute ./internal/pineevent
