@@ -181,15 +181,27 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 
 		nodes = append(nodes, node)
 	}
-	// Selection skips the selector's filters for a single candidate, so a
-	// lone preferred node is taken only if it has no recorded failure.
-	if preferred := pineroute.WithoutQuarantined(nodes); len(preferred) > 1 ||
-		len(preferred) == 1 && preferred[0].Marker().Count() == 0 {
-		if node := p.selectNode(ctx, preferred); node != nil {
+	if preferred := pineroute.WithoutQuarantined(nodes); len(preferred) > 0 {
+		if node := p.selectPreferred(ctx, preferred); node != nil {
 			return node
 		}
 	}
 	return p.selectNode(ctx, nodes)
+}
+
+// selectPreferred selects among non-quarantined nodes with the hop's selector.
+// Selection and the selector's filters pass a single candidate through
+// unchecked, so a lone node is offered together with a copy, which shares its
+// marker and metadata, and is judged by the same cooldown rules as any other.
+func (p *chainHop) selectPreferred(ctx context.Context, preferred []*chain.Node) *chain.Node {
+	if len(preferred) > 1 {
+		return p.selectNode(ctx, preferred)
+	}
+	only := preferred[0]
+	if p.selectNode(ctx, []*chain.Node{only, only.Copy()}) == nil {
+		return nil
+	}
+	return only
 }
 
 func (p *chainHop) selectNode(ctx context.Context, nodes []*chain.Node) *chain.Node {

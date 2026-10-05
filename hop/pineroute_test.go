@@ -89,9 +89,13 @@ func (t *refusingTransport) Options() *corechain.TransportOptions { return &t.op
 func (t *refusingTransport) Copy() corechain.Transporter          { return t }
 
 func newTestRouter(nodes ...*corechain.Node) *xchain.Router {
+	return newTestRouterWithFailFilter(1, 30*time.Second, nodes...)
+}
+
+func newTestRouterWithFailFilter(maxFails int, failTimeout time.Duration, nodes ...*corechain.Node) *xchain.Router {
 	h := NewHop(NodeOption(nodes...), SelectorOption(xselector.NewSelector(
 		xselector.FIFOStrategy[*corechain.Node](),
-		xselector.FailFilter[*corechain.Node](1, 30*time.Second),
+		xselector.FailFilter[*corechain.Node](maxFails, failTimeout),
 		xselector.BackupFilter[*corechain.Node](),
 	)))
 	c := xchain.NewChain("provider-routes")
@@ -600,6 +604,55 @@ func TestCooledPreferredRouteDoesNotBeatUsableQuarantinedRoute(t *testing.T) {
 	}
 	if cooled.dials.Load() != before {
 		t.Fatal("a route in failure cooldown was dialed ahead of a usable quarantined route")
+	}
+}
+
+// A lone preferred route is judged by the selector's own cooldown rules: once
+// its cooldown has expired, or while it is below maxFails, it is still
+// preferred over a quarantined route even though its failure count is non-zero.
+func TestLonePreferredRouteFollowsSelectorCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		maxFails    int
+		failTimeout time.Duration
+		wait        time.Duration
+	}{
+		{"cooldown expired", 1, 20 * time.Millisecond, 40 * time.Millisecond},
+		{"below max fails", 3, 30 * time.Second, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := fmt.Sprintf("%d-%d", tc.maxFails, time.Now().UnixNano())
+			refused := map[string]error{}
+			for i := 0; i < 3; i++ {
+				refused[fmt.Sprintf("q-%d-%s.example", i, id)] = socksReply(4)
+			}
+			quarantined := &refusingTransport{refused: refused}
+			preferred := &refusingTransport{}
+			preferredNode := pineNode("er_pref_"+id, preferred)
+			r := newTestRouterWithFailFilter(tc.maxFails, tc.failTimeout, pineNode("er_quar_"+id, quarantined), preferredNode)
+			for host := range refused {
+				if err := dial(t, r, host+":443"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			preferred.handshakeErr = errors.New("proxy authentication failed")
+			if err := dial(t, r, "blip-"+id+".example:443"); err != nil {
+				t.Fatal(err)
+			}
+			preferred.handshakeErr = nil
+			if preferredNode.Marker().Count() == 0 {
+				t.Fatal("precondition: preferred route should carry a failure")
+			}
+			time.Sleep(tc.wait)
+			quarantinedBefore, preferredBefore := quarantined.connects.Load(), preferred.connects.Load()
+			if err := dial(t, r, "next-"+id+".example:443"); err != nil {
+				t.Fatal(err)
+			}
+			if quarantined.connects.Load() != quarantinedBefore || preferred.connects.Load() != preferredBefore+1 {
+				t.Fatalf("quarantined=%d preferred=%d: an eligible preferred route lost to quarantine",
+					quarantined.connects.Load()-quarantinedBefore, preferred.connects.Load()-preferredBefore)
+			}
+		})
 	}
 }
 
