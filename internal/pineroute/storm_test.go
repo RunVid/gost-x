@@ -110,3 +110,23 @@ func TestNoRouteSummaryStaysWithinTheCoordinatorsBound(t *testing.T) {
 		t.Fatalf("summaries %v, want [%d 10]", flushed, maxSuppressedPerSummary)
 	}
 }
+
+func TestLateTimerDoesNotCloseANewerWindow(t *testing.T) {
+	merger, timers := newTestMerger(8)
+	var flushed []int
+	flush := func(_ any, n int) { flushed = append(flushed, n) }
+	merger.merge("tcp", "late.example:443", 1, flush)
+	// The first window is closed (say by its timer) and a new one opens...
+	(*timers)[0]()
+	merger.merge("tcp", "late.example:443", 2, flush)
+	merger.merge("tcp", "late.example:443", 3, flush)
+	// ...then the first timer fires again late: the new window stays open.
+	(*timers)[0]()
+	if merger.merge("tcp", "late.example:443", 4, flush) {
+		t.Fatal("a stale timer closed the newer window")
+	}
+	(*timers)[1]()
+	if len(flushed) != 1 || flushed[0] != 2 {
+		t.Fatalf("flushed %v, want [2]", flushed)
+	}
+}

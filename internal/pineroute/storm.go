@@ -118,17 +118,23 @@ func (m *noRouteMerger) merge(network, address string, payload any, flush func(a
 	if len(m.windows) >= m.limit {
 		return true
 	}
-	m.windows[id] = &noRouteWindow{flush: flush}
-	m.after(m.window, func() { m.close(id) })
+	window := &noRouteWindow{flush: flush}
+	m.windows[id] = window
+	m.after(m.window, func() { m.close(id, window) })
 	return true
 }
 
-func (m *noRouteMerger) close(id string) {
+// close ends window. A late timer never closes a newer window for the same
+// destination.
+func (m *noRouteMerger) close(id string, window *noRouteWindow) {
 	m.mu.Lock()
-	window := m.windows[id]
+	if m.windows[id] != window {
+		m.mu.Unlock()
+		return
+	}
 	delete(m.windows, id)
 	m.mu.Unlock()
-	if window != nil && window.suppressed > 0 {
+	if window.suppressed > 0 {
 		window.flush(window.last, window.suppressed)
 	}
 }
