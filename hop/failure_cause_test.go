@@ -53,8 +53,10 @@ func TestRequestEventCarriesFailureCause(t *testing.T) {
 		{"ttl expired then success", []error{socksReply(6), nil}, "route"},
 		{"proxy failure then success", []error{socksReply(1), nil}, "network"},
 		{"proxy timeout then success", []error{timeout, nil}, "network"},
+		{"address type unsupported then success", []error{socksReply(8), nil}, "unknown"},
 		{"every route refused by policy", []error{socksReply(2), socksReply(2)}, "vendor_policy"},
 		{"no route reaches the site", []error{socksReply(4), socksReply(5), socksReply(4)}, "site"},
+		{"every route address type unsupported", []error{socksReply(8), socksReply(8)}, "unknown"},
 		{"only one route tried", []error{socksReply(4)}, "unknown"},
 		{"every proxy broken", []error{socksReply(1), timeout}, "network"},
 	}
@@ -77,6 +79,20 @@ func TestRequestEventCarriesFailureCause(t *testing.T) {
 				t.Fatalf("outcome = %q", event.Outcome)
 			}
 		})
+	}
+}
+
+func directPineNode(id string, transport corechain.Transporter) *corechain.Node {
+	return corechain.NewNode(id, "",
+		corechain.TransportNodeOption(transport),
+		corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct"})))
+}
+
+func TestSingleRouteUpstreamFailureCauseIsNetwork(t *testing.T) {
+	host := fmt.Sprintf("upstream-cause-%d.example", time.Now().UnixNano())
+	route := pineNode("er_upstream_"+host, &refusingTransport{dialErr: fmt.Errorf("proxy connect failed")})
+	if got, event := requestCause(t, host, route); got != "network" {
+		t.Fatalf("failure_cause = %q, want network (event %+v)", got, event)
 	}
 }
 
@@ -114,5 +130,27 @@ func TestDirectFallbackFailureCountsTowardSite(t *testing.T) {
 		corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct"})))
 	if got, event := requestCause(t, host, managed, direct); got != "site" {
 		t.Fatalf("failure_cause = %q, want site (event %+v)", got, event)
+	}
+}
+
+func TestDirectRefusedThenSuccessCauseIsIPRefusedBySite(t *testing.T) {
+	host := fmt.Sprintf("direct-refused-%d.example", time.Now().UnixNano())
+	direct := directPineNode("direct-refused-"+host, &refusingTransport{refused: map[string]error{
+		host: &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED},
+	}})
+	managed := pineNode("er_direct-refused-"+host, &refusingTransport{})
+	if got, event := requestCause(t, host, direct, managed); got != "ip_refused_by_site" {
+		t.Fatalf("failure_cause = %q, want ip_refused_by_site (event %+v)", got, event)
+	}
+}
+
+func TestDirectDNSNotFoundThenSuccessCauseIsUnknown(t *testing.T) {
+	host := fmt.Sprintf("direct-dns-%d.example", time.Now().UnixNano())
+	direct := directPineNode("direct-dns-"+host, &refusingTransport{refused: map[string]error{
+		host: &net.DNSError{Err: "no such host", Name: host, IsNotFound: true},
+	}})
+	managed := pineNode("er_direct-dns-"+host, &refusingTransport{})
+	if got, event := requestCause(t, host, direct, managed); got != "unknown" {
+		t.Fatalf("failure_cause = %q, want unknown (event %+v)", got, event)
 	}
 }

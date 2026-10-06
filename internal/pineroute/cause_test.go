@@ -26,21 +26,28 @@ func TestFailureCauseRules(t *testing.T) {
 	transport := func(route routeKey) attemptRecord {
 		return attemptRecord{route: route, dialed: "tcp/site:443", failed: true}
 	}
+	upstream := func(route routeKey) attemptRecord {
+		return attemptRecord{route: route, dialed: "tcp/site:443", failed: true, upstream: true}
+	}
+	directRefused := func(route routeKey) attemptRecord {
+		return attemptRecord{route: route, dialed: "tcp/site:443", failed: true, destination: true, directRefused: true}
+	}
 	cases := map[string]struct {
 		records   []attemptRecord
 		succeeded bool
 		canceled  bool
 		want      string
 	}{
-		"first attempt succeeded":       {[]attemptRecord{ok(a)}, true, false, ""},
-		"vendor policy then success":    {[]attemptRecord{reply(a, 2), ok(b)}, true, false, CauseVendorPolicy},
-		"refused then success":          {[]attemptRecord{reply(a, 5), ok(b)}, true, false, CauseIPRefusedBySite},
-		"host unreachable then success": {[]attemptRecord{reply(a, 4), ok(b)}, true, false, CauseRoute},
-		"network unreachable":           {[]attemptRecord{reply(a, 3), ok(b)}, true, false, CauseRoute},
-		"ttl expired":                   {[]attemptRecord{reply(a, 6), ok(b)}, true, false, CauseRoute},
-		"transport then success":        {[]attemptRecord{transport(a), ok(b)}, true, false, CauseNetwork},
-		"general failure then success":  {[]attemptRecord{reply(a, 1), ok(b)}, true, false, CauseNetwork},
-		"first failure decides":         {[]attemptRecord{reply(a, 5), reply(b, 4), ok(c)}, true, false, CauseIPRefusedBySite},
+		"first attempt succeeded":               {[]attemptRecord{ok(a)}, true, false, ""},
+		"vendor policy then success":            {[]attemptRecord{reply(a, 2), ok(b)}, true, false, CauseVendorPolicy},
+		"refused then success":                  {[]attemptRecord{reply(a, 5), ok(b)}, true, false, CauseIPRefusedBySite},
+		"host unreachable then success":         {[]attemptRecord{reply(a, 4), ok(b)}, true, false, CauseRoute},
+		"network unreachable":                   {[]attemptRecord{reply(a, 3), ok(b)}, true, false, CauseRoute},
+		"ttl expired":                           {[]attemptRecord{reply(a, 6), ok(b)}, true, false, CauseRoute},
+		"transport then success":                {[]attemptRecord{transport(a), ok(b)}, true, false, CauseNetwork},
+		"general failure then success":          {[]attemptRecord{reply(a, 1), ok(b)}, true, false, CauseNetwork},
+		"address type unsupported then success": {[]attemptRecord{reply(a, 8), ok(b)}, true, false, CauseUnknown},
+		"first failure decides":                 {[]attemptRecord{reply(a, 5), reply(b, 4), ok(c)}, true, false, CauseIPRefusedBySite},
 		"same dialed address preferred": {
 			[]attemptRecord{{route: a, dialed: "tcp/other:443", failed: true, reply: 4, destination: true}, reply(b, 5), ok(c)},
 			true, false, CauseIPRefusedBySite,
@@ -54,11 +61,20 @@ func TestFailureCauseRules(t *testing.T) {
 		"every route reached site":      {[]attemptRecord{reply(a, 4), reply(b, 5), reply(c, 2)}, false, false, CauseSite},
 		"single route failed":           {[]attemptRecord{reply(a, 4)}, false, false, CauseUnknown},
 		"same route twice":              {[]attemptRecord{reply(a, 4), reply(a, 4)}, false, false, CauseUnknown},
+		"single route upstream failure": {[]attemptRecord{upstream(a)}, false, false, CauseNetwork},
+		"same route twice upstream":     {[]attemptRecord{upstream(a), upstream(a)}, false, false, CauseNetwork},
+		"single route plain transport":  {[]attemptRecord{transport(a)}, false, false, CauseUnknown},
 		"every route transport failure": {[]attemptRecord{transport(a), transport(b)}, false, false, CauseNetwork},
-		"site with a broken route":      {[]attemptRecord{transport(a), reply(b, 4)}, false, false, CauseSite},
-		"policy and transport only":     {[]attemptRecord{reply(a, 2), transport(b)}, false, false, CauseUnknown},
-		"no attempt":                    {nil, false, false, CauseUnknown},
-		"caller canceled":               {[]attemptRecord{reply(a, 4), reply(b, 4)}, false, true, CauseUnknown},
+		"site with a broken route":      {[]attemptRecord{transport(a), reply(b, 4)}, false, false, CauseUnknown},
+		"address type unsupported only": {[]attemptRecord{reply(a, 8), reply(b, 8)}, false, false, CauseUnknown},
+		"direct refused then success":   {[]attemptRecord{directRefused(a), ok(b)}, true, false, CauseIPRefusedBySite},
+		"direct DNS failure then success": {
+			[]attemptRecord{{route: a, dialed: "tcp/site:443", failed: true, destination: true}, ok(b)},
+			true, false, CauseUnknown,
+		},
+		"policy and transport only": {[]attemptRecord{reply(a, 2), transport(b)}, false, false, CauseUnknown},
+		"no attempt":                {nil, false, false, CauseUnknown},
+		"caller canceled":           {[]attemptRecord{reply(a, 4), reply(b, 4)}, false, true, CauseUnknown},
 	}
 	for name, tc := range cases {
 		if got := failureCause(tc.records, tc.succeeded, tc.canceled); got != tc.want {
@@ -79,6 +95,12 @@ func TestRecordAttemptClassifiesErrorsAndIgnoresUntrackedRequests(t *testing.T) 
 	// A reply from an intermediate hop is a route failure, not the site.
 	if got := FailureCause(ctx, nil); got != CauseNetwork {
 		t.Fatalf("upstream reply cause = %q, want %q", got, CauseNetwork)
+	}
+
+	ctx = WithAttempts(context.Background())
+	RecordAttempt(ctx, pineNode("er_single_upstream"), "tcp", "site:443", UpstreamFailure(errors.New("proxy dial failed")))
+	if got := FailureCause(ctx, errors.New("failed")); got != CauseNetwork {
+		t.Fatalf("single upstream failure cause = %q, want %q", got, CauseNetwork)
 	}
 
 	ctx = WithAttempts(context.Background())
@@ -105,9 +127,33 @@ func TestRecordAttemptClassifiesErrorsAndIgnoresUntrackedRequests(t *testing.T) 
 		}
 	}
 	ctx = WithAttempts(context.Background())
-	RecordAttempt(ctx, pineNode("er_a"), "tcp", "site:443", errors.New("proxy dial failed"))
+	RecordAttempt(ctx, pineNode("er_a"), "tcp", "site:443", replyError(4))
 	RecordAttempt(ctx, directNode(), "tcp", "site:443", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED})
 	if got := FailureCause(ctx, syscall.ECONNREFUSED); got != CauseSite {
 		t.Fatalf("direct refused cause = %q, want %q", got, CauseSite)
+	}
+
+	ctx = WithAttempts(context.Background())
+	RecordAttempt(ctx, directNode(), "tcp", "site:443", UpstreamFailure(&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}))
+	a, _ := ctx.Value(attemptsKey{}).(*attempts)
+	a.mu.Lock()
+	records := append([]attemptRecord(nil), a.records...)
+	a.mu.Unlock()
+	if len(records) != 1 || records[0].destination {
+		t.Fatalf("upstream direct refusal record = %+v, want no destination evidence", records)
+	}
+
+	ctx = WithAttempts(context.Background())
+	RecordAttempt(ctx, directNode(), "tcp", "site:443", &net.OpError{Op: "dial", Err: syscall.ECONNREFUSED})
+	RecordAttempt(ctx, pineNode("er_after_direct_refused"), "tcp", "site:443", nil)
+	if got := FailureCause(ctx, nil); got != CauseIPRefusedBySite {
+		t.Fatalf("direct refused failover cause = %q, want %q", got, CauseIPRefusedBySite)
+	}
+
+	ctx = WithAttempts(context.Background())
+	RecordAttempt(ctx, directNode(), "tcp", "site:443", &net.DNSError{Err: "no such host", Name: "site", IsNotFound: true})
+	RecordAttempt(ctx, pineNode("er_after_direct_dns"), "tcp", "site:443", nil)
+	if got := FailureCause(ctx, nil); got != CauseUnknown {
+		t.Fatalf("direct DNS failover cause = %q, want %q", got, CauseUnknown)
 	}
 }

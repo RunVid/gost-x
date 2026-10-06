@@ -24,9 +24,11 @@ const (
 
 // attemptRecord is the part of one route attempt the cause rules need.
 type attemptRecord struct {
-	route  routeKey
-	dialed string
-	failed bool
+	route         routeKey
+	dialed        string
+	failed        bool
+	upstream      bool
+	directRefused bool
 	// reply is the SOCKS5 reply code a proxy returned for the destination,
 	// or 0 when the attempt failed for another reason.
 	reply uint8
@@ -44,13 +46,15 @@ func RecordAttempt(ctx context.Context, node *chain.Node, network, dialed string
 	if a == nil || route == (routeKey{}) {
 		return
 	}
-	record := attemptRecord{route: route, dialed: network + "/" + dialed, failed: err != nil}
+	record := attemptRecord{route: route, dialed: network + "/" + dialed, failed: err != nil, upstream: isUpstreamFailure(err)}
 	if err != nil {
 		var reply socks5ReplyError
 		if !isUpstreamFailure(err) && errors.As(err, &reply) {
 			record.reply = reply.SOCKS5ReplyCode()
 		}
-		record.destination = DestinationScoped(network, err) || IsDirect(node) && directDestinationFailure(err)
+		direct := !record.upstream && tcpNetwork(network) && IsDirect(node)
+		record.destination = DestinationScoped(network, err) || direct && directDestinationFailure(err)
+		record.directRefused = direct && errors.Is(err, syscall.ECONNREFUSED)
 	}
 	a.mu.Lock()
 	a.records = append(a.records, record)
@@ -91,26 +95,36 @@ func failureCause(records []attemptRecord, succeeded, canceled bool) string {
 		return CauseUnknown
 	}
 	routes := make(map[routeKey]struct{}, len(records))
-	policyOnly, anyDestination, allTransport := true, false, true
+	destinationRoutes := make(map[routeKey]struct{}, len(records))
+	policyOnly, allTransport, allUpstream := true, true, true
+	sawFailed := false
 	for _, record := range records {
 		routes[record.route] = struct{}{}
+		if record.failed {
+			sawFailed = true
+			if !record.upstream {
+				allUpstream = false
+			}
+		}
 		if record.reply != replyNotAllowed {
 			policyOnly = false
 		}
 		if record.destination {
 			allTransport = false
-			if record.reply != replyNotAllowed {
-				anyDestination = true
+			if record.reply != replyNotAllowed && record.reply != 8 {
+				destinationRoutes[record.route] = struct{}{}
 			}
 		}
 	}
 	switch {
+	case sawFailed && allUpstream:
+		return CauseNetwork
 	case policyOnly:
 		return CauseVendorPolicy
 	case len(routes) < 2:
 		return CauseUnknown
-	case anyDestination:
-		// At least one route reached its proxy and the destination still
+	case len(destinationRoutes) >= 2:
+		// At least two routes reached their proxies and the destination still
 		// failed there; no route reached the site.
 		return CauseSite
 	case allTransport:
@@ -139,6 +153,9 @@ func failoverCause(records []attemptRecord) string {
 		if record.dialed != winner.dialed {
 			continue
 		}
+		if record.directRefused {
+			return CauseIPRefusedBySite
+		}
 		switch record.reply {
 		case replyNotAllowed:
 			return CauseVendorPolicy
@@ -146,6 +163,11 @@ func failoverCause(records []attemptRecord) string {
 			return CauseIPRefusedBySite
 		case 3, 4, 6:
 			return CauseRoute
+		case 8:
+			return CauseUnknown
+		}
+		if record.destination && record.reply == 0 {
+			return CauseUnknown
 		}
 		return CauseNetwork
 	}
