@@ -148,11 +148,16 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	all := p.Nodes()
 	pineroute.NoteHop(ctx, all)
 	var nodes []*chain.Node
+	present, refused := 0, 0
 	for _, node := range all {
 		if node == nil {
 			continue
 		}
+		present++
 		if pineroute.Skip(ctx, node, options.Network, options.Host) {
+			if pineroute.Refused(ctx, node, options.Network, options.Host) {
+				refused++
+			}
 			continue
 		}
 		// node level bypass
@@ -182,6 +187,9 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		}
 
 		nodes = append(nodes, node)
+	}
+	if len(nodes) == 0 && present > 0 && refused == present {
+		pineroute.NoteAllRefused(ctx)
 	}
 	if preferred := pineroute.WithoutEjected(nodes); len(preferred) > 0 {
 		if node := p.selectPreferred(ctx, preferred); node != nil {

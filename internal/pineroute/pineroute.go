@@ -172,8 +172,10 @@ type attempts struct {
 	records  []attemptRecord
 	// hops maps each managed route seen by this request's hop selection to
 	// the hop's managed routes, for the ejection cap.
-	hops    map[incarnation][]incarnation
-	request context.Context
+	hops map[incarnation][]incarnation
+	// allRefused: see NoteAllRefused.
+	allRefused bool
+	request    context.Context
 }
 
 // WithAttempts returns a context that tracks the routes tried by one router

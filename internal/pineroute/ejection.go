@@ -157,44 +157,38 @@ func newEjectionStore(limit int, base time.Duration) *ejectionStore {
 	}
 }
 
-// recordLocked returns route's record, creating it if needed.
+// recordLocked returns route's record, creating it if needed, or nil when
+// the store is full of active ejections: those are never dropped early.
 func (s *ejectionStore) recordLocked(route incarnation, now time.Time) *ejectionRecord {
 	if record := s.entries[route]; record != nil {
 		return record
 	}
-	if len(s.entries) >= s.limit {
-		s.evictLocked(now)
+	if len(s.entries) >= s.limit && !s.evictLocked(now) {
+		return nil
 	}
 	record := &ejectionRecord{}
 	s.entries[route] = record
 	return record
 }
 
-// evictLocked drops one record: a route that is not ejected and has the
-// oldest evidence, else the ejection that ends first. A dropped ejection's
-// restore timer finds no matching generation and does nothing.
-func (s *ejectionStore) evictLocked(now time.Time) {
+// evictLocked drops the record of a route that is not ejected and has the
+// oldest evidence. It reports false when every record is an active ejection.
+func (s *ejectionStore) evictLocked(now time.Time) bool {
 	var victim incarnation
 	var victimRecord *ejectionRecord
 	for route, record := range s.entries {
-		if victimRecord == nil || evictBefore(record, victimRecord, now) {
+		if record.until.After(now) {
+			continue
+		}
+		if victimRecord == nil || record.lastBad.Before(victimRecord.lastBad) {
 			victim, victimRecord = route, record
 		}
 	}
-	if victimRecord != nil {
-		delete(s.entries, victim)
+	if victimRecord == nil {
+		return false
 	}
-}
-
-func evictBefore(a, b *ejectionRecord, now time.Time) bool {
-	aEjected, bEjected := a.until.After(now), b.until.After(now)
-	if aEjected != bEjected {
-		return !aEjected
-	}
-	if !aEjected {
-		return a.lastBad.Before(b.lastBad)
-	}
-	return a.until.Before(b.until)
+	delete(s.entries, victim)
+	return true
 }
 
 // noteBad records evidence against route that did not eject it, so the
@@ -206,7 +200,9 @@ func (s *ejectionStore) noteBad(route incarnation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	s.recordLocked(route, now).lastBad = now
+	if record := s.recordLocked(route, now); record != nil {
+		record.lastBad = now
+	}
 }
 
 // eject ejects route unless it is already ejected or ejecting it would eject
@@ -219,6 +215,10 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 	s.mu.Lock()
 	now := s.now()
 	record := s.recordLocked(route, now)
+	if record == nil {
+		s.mu.Unlock()
+		return false
+	}
 	if record.until.After(now) || !s.withinCapLocked(route, hop, now) {
 		record.lastBad = now
 		s.mu.Unlock()
@@ -391,27 +391,31 @@ func WithoutEjected(nodes []*chain.Node) []*chain.Node {
 
 // PanicSelect picks a node when the selector found none usable because every
 // candidate is ejected or cooling down. Trying a cooled route beats failing
-// the request with no route: non-ejected routes come first, then non-backup
-// ones, then hop order. Candidates were already filtered for this request
+// the request with no route. Order: primary before backup, non-ejected
+// before ejected within each, then hop order; a direct node only when no
+// managed route is left. Candidates were already filtered for this request
 // (tried routes and per-destination refusals), and an explicit-country hop
-// has no direct node, so this never adds a direct exit.
+// has no direct node, so this never adds a direct exit there.
 func PanicSelect(nodes []*chain.Node) *chain.Node {
 	if !Enabled {
 		return nil
 	}
 	now := time.Now()
 	var best *chain.Node
-	bestRank := 4
+	bestRank := 5
 	for _, node := range nodes {
 		if node == nil {
 			continue
 		}
-		rank := 0
-		if route, ok := managedIncarnation(node); ok && defaultEjections.ejected(route, now) {
-			rank += 2
-		}
-		if backupNode(node) {
-			rank++
+		rank := 4
+		if route, ok := managedIncarnation(node); ok {
+			rank = 0
+			if backupNode(node) {
+				rank += 2
+			}
+			if defaultEjections.ejected(route, now) {
+				rank++
+			}
 		}
 		if rank < bestRank {
 			best, bestRank = node, rank

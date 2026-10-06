@@ -231,17 +231,36 @@ func TestEjectionJitterStaysWithinTenPercent(t *testing.T) {
 	}
 }
 
-func TestStaleRestoreTimerDoesNothing(t *testing.T) {
-	store, clock := newTestEjectionStore(t, 1)
-	hop := testHop(4)
+func TestFullStoreKeepsActiveEjections(t *testing.T) {
+	store, clock := newTestEjectionStore(t, 2)
+	hop := testHop(8)
 	store.eject(hop[0], routeInfo{}, hop, ReasonTimeout)
-	// A full store evicts the ejection to make room for another route.
 	store.noteBad(hop[1])
+	// The non-ejected record makes room; the active ejection stays.
+	if !store.eject(hop[2], routeInfo{}, hop, ReasonTimeout) {
+		t.Fatal("a full store did not evict a non-ejected record")
+	}
+	if !store.ejected(hop[0], clock.now) || !store.ejected(hop[2], clock.now) {
+		t.Fatal("an active ejection was dropped")
+	}
+	// Full of active ejections: new evidence is not recorded.
+	if store.eject(hop[3], routeInfo{}, hop, ReasonTimeout) {
+		t.Fatal("a store full of active ejections took another route")
+	}
+	store.noteBad(hop[3])
+	if len(store.entries) != 2 {
+		t.Fatalf("entries=%d, want 2", len(store.entries))
+	}
+	clock.now = clock.now.Add(defaultEjectionBase)
 	clock.fire()
+	restored := 0
 	for _, event := range clock.events {
 		if event.Kind == RouteRestored {
-			t.Fatal("an evicted ejection was restored")
+			restored++
 		}
+	}
+	if restored != 2 {
+		t.Fatalf("restored %d ejections, want 2", restored)
 	}
 }
 
@@ -323,11 +342,18 @@ func TestPanicSelectOrder(t *testing.T) {
 	ctx := WithAttempts(context.Background())
 	NoteHop(ctx, []*chain.Node{ejectedPrimary, primary, backup, pineNode("er_panic_4")})
 	RecordRouteFailure(ctx, ejectedPrimary, "tcp", errors.New("reset"))
-	if got := PanicSelect([]*chain.Node{ejectedPrimary, backup, primary}); got != primary {
+	direct := chain.NewNode("direct", "", chain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct", "backup": true})))
+	if got := PanicSelect([]*chain.Node{direct, ejectedPrimary, backup, primary}); got != primary {
 		t.Fatalf("panic picked %v, want the non-ejected primary", got.Name)
 	}
-	if got := PanicSelect([]*chain.Node{ejectedPrimary, backup}); got != backup {
-		t.Fatalf("panic picked %v, want the non-ejected backup", got.Name)
+	if got := PanicSelect([]*chain.Node{direct, backup, ejectedPrimary}); got != ejectedPrimary {
+		t.Fatalf("panic picked %v, want the ejected primary before any backup", got.Name)
+	}
+	if got := PanicSelect([]*chain.Node{direct, backup}); got != backup {
+		t.Fatalf("panic picked %v, want the managed backup before direct", got.Name)
+	}
+	if got := PanicSelect([]*chain.Node{direct}); got != direct {
+		t.Fatal("panic did not use direct as the last resort of an automatic plan")
 	}
 	if got := PanicSelect([]*chain.Node{ejectedPrimary}); got != ejectedPrimary {
 		t.Fatal("panic did not fall back to an ejected route")

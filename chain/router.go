@@ -237,7 +237,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		FailureCause:    pineroute.FailureCause(ctx, err),
 		DurationMS:      time.Since(startedAt).Milliseconds(),
 	}
-	if attempts == 0 && errors.Is(err, pineroute.ErrNoRoute) {
+	if attempts == 0 && errors.Is(err, pineroute.ErrNoRoute) && pineroute.AllRefused(ctx) {
 		// Every route was excluded for this destination before any attempt.
 		// Report the first such failure in a window; the window's summary
 		// carries the rest as suppressed_count.
@@ -252,13 +252,15 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 }
 
 // emitNoRouteSummary reports the no-route failures a window suppressed as
-// one request event: the latest one, with the count.
+// one request event when the window closes: the latest one's identity, with
+// the count.
 func emitNoRouteSummary(last any, suppressed int) {
 	event, ok := last.(pineevent.Event)
 	if !ok {
 		return
 	}
 	event.SuppressedCount = suppressed
+	event.ObservedAtUnixMS = time.Now().UnixMilli()
 	pineevent.Emit(event)
 }
 

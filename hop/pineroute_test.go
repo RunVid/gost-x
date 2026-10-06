@@ -12,6 +12,7 @@ import (
 
 	corechain "github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
+	"github.com/go-gost/core/routing"
 	xchain "github.com/go-gost/x/chain"
 	"github.com/go-gost/x/internal/pineevent"
 	"github.com/go-gost/x/internal/pineroute"
@@ -896,4 +897,39 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 	if noRoute != 2 || suppressed != 999 {
 		t.Fatalf("no_route events=%d suppressed=%d, want 2 and 999", noRoute, suppressed)
 	}
+	var leader, summary pineevent.Event
+	for _, event := range events.kind("request") {
+		if event.ErrorClass == "no_route" && event.SuppressedCount == 0 {
+			leader = event
+		} else if event.SuppressedCount > 0 {
+			summary = event
+		}
+	}
+	if summary.ObservedAtUnixMS-leader.ObservedAtUnixMS < 100 {
+		t.Fatalf("summary observed %d ms after the leader, want at the window close (>= 100 ms)",
+			summary.ObservedAtUnixMS-leader.ObservedAtUnixMS)
+	}
 }
+
+// Only requests whose routes were all excluded by per-destination refusals
+// are merged: a matcher or bypass that leaves no route is reported each time.
+func TestNoRouteFromOtherExclusionsIsNotMerged(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Minute)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	only := pineNode("er_matcher_"+id, &refusingTransport{})
+	only.Options().Matcher = neverMatches{}
+	r := newTestRouter(only)
+	for i := 0; i < 5; i++ {
+		if err := dial(t, r, "filtered-"+id+".example:443"); !errors.Is(err, pineroute.ErrNoRoute) {
+			t.Fatalf("want no_route, got %v", err)
+		}
+	}
+	if n := len(events.kind("request")); n != 5 {
+		t.Fatalf("%d request events for 5 matcher exclusions, want 5", n)
+	}
+}
+
+type neverMatches struct{}
+
+func (neverMatches) Match(*routing.Request) bool { return false }

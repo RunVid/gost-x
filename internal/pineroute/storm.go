@@ -1,8 +1,11 @@
 package pineroute
 
 import (
+	"context"
 	"sync"
 	"time"
+
+	"github.com/go-gost/core/chain"
 )
 
 // When every route of a destination is excluded by its per-destination
@@ -42,10 +45,41 @@ func newNoRouteMerger(limit int, window time.Duration) *noRouteMerger {
 	}
 }
 
+// NoteAllRefused records that hop selection for the request in ctx found no
+// candidate because the per-destination refusals excluded every node. Only
+// such failures are merged; other exclusions (bypass, matchers, an empty
+// plan) are reported one by one.
+func NoteAllRefused(ctx context.Context) {
+	if a, _ := ctx.Value(attemptsKey{}).(*attempts); a != nil {
+		a.mu.Lock()
+		a.allRefused = true
+		a.mu.Unlock()
+	}
+}
+
+// AllRefused reports whether NoteAllRefused was called for ctx's request.
+func AllRefused(ctx context.Context) bool {
+	a, _ := ctx.Value(attemptsKey{}).(*attempts)
+	if a == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.allRefused
+}
+
+// Refused reports whether the per-destination refusals exclude node for
+// network/address.
+func Refused(ctx context.Context, node *chain.Node, network, address string) bool {
+	id := nodeRouteKey(node)
+	return Enabled && id != (routeKey{}) && Tracking(ctx) && defaultRefusals.contains(id, network, address, time.Now())
+}
+
 // MergeNoRoute is called for a request that failed with no route before any
-// attempt. It reports whether the caller should report the failure now: true
-// for the first failure for network/address in a window (or when merging is
-// not possible), false when the failure was counted into the open window.
+// attempt because every route refused the destination (AllRefused). It
+// reports whether the caller should report the failure now: true for the
+// first failure for network/address in a window (or when merging is not
+// possible), false when the failure was counted into the open window.
 // payload describes this failure. When a window that suppressed failures
 // closes, flush runs once with the latest suppressed payload and the number
 // of suppressed failures.
