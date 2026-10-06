@@ -157,6 +157,7 @@ type attempts struct {
 	mu       sync.Mutex
 	tried    map[routeKey]struct{}
 	suspects []suspect
+	records  []attemptRecord
 	request  context.Context
 }
 
