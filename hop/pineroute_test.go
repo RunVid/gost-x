@@ -23,6 +23,7 @@ import (
 
 func TestMain(m *testing.M) {
 	pineroute.Enabled = true
+	pineroute.Escalation = true
 	m.Run()
 }
 

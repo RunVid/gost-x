@@ -34,6 +34,16 @@ const (
 	ejectionBaseEnvironment = "PINE_GOST_EJECTION_BASE"
 )
 
+// Escalation turns on #637's route-health rules: escalating per-destination
+// TTLs, escalating ejection with a cap, route-wide ejection, panic selection
+// and no_route merging. The session coordinator sets PINE_GOST_ROUTE_EJECTION
+// from the deployment's chart value. Without it GOST keeps the #7/#8 rules: fixed
+// TTLs, a fixed 30 s differential ejection without cap, no panic and no
+// merging. Route events are emitted either way.
+var Escalation = os.Getenv(escalationEnvironment) == "on"
+
+const escalationEnvironment = "PINE_GOST_ROUTE_EJECTION"
+
 // Ejection reasons. They are bounded: the coordinator uses them as a metric
 // label.
 const (
@@ -238,15 +248,21 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 		s.mu.Unlock()
 		return false
 	}
-	if record.until.After(now) || !s.withinCapLocked(route, hop, now) {
+	if record.until.After(now) || Escalation && !s.withinCapLocked(route, hop, now) {
 		record.lastBad = now
 		s.mu.Unlock()
 		return false
 	}
-	s.decayLocked(record, now)
-	record.k = min(record.k+1, maxEjectionK)
-	ttl := min(time.Duration(record.k)*s.base, s.max)
-	ttl += s.jitter(ttl / 10)
+	var ttl time.Duration
+	if Escalation {
+		s.decayLocked(record, now)
+		record.k = min(record.k+1, maxEjectionK)
+		ttl = min(time.Duration(record.k)*s.base, s.max)
+		ttl += s.jitter(ttl / 10)
+	} else {
+		// #8: a fixed ejection, no cap.
+		record.k, ttl = 1, s.base
+	}
 	s.generation++
 	record.until, record.ttl, record.reason, record.lastBad = now.Add(ttl), ttl, reason, now
 	record.generation, record.info = s.generation, info
@@ -344,7 +360,7 @@ func hopOf(ctx context.Context, route incarnation) []incarnation {
 // selector's fixed cooldown still applies; ejection extends the avoidance
 // with escalating periods.
 func RecordRouteFailure(ctx context.Context, node *chain.Node, network string, err error) {
-	if !Enabled || err == nil || IgnoreFailure(ctx, node, network, err) {
+	if !Enabled || !Escalation || err == nil || IgnoreFailure(ctx, node, network, err) {
 		return
 	}
 	route, ok := managedIncarnation(node)
@@ -408,7 +424,7 @@ func WithoutEjected(nodes []*chain.Node) []*chain.Node {
 // (tried routes and per-destination refusals), and an explicit-country hop
 // has no direct node, so this never adds a direct exit there.
 func PanicSelect(nodes []*chain.Node) *chain.Node {
-	if !Enabled {
+	if !Enabled || !Escalation {
 		return nil
 	}
 	now := time.Now()
