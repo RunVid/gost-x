@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -725,15 +726,26 @@ func captureEvents(t *testing.T) *eventLog {
 }
 
 func (l *eventLog) kind(kind string) []pineevent.Event {
+	return l.match(func(event pineevent.Event) bool { return event.Kind == kind })
+}
+
+// match returns the captured events that satisfy keep. Tests filter by their
+// own route or host: timers of earlier tests (restores, merge windows) can
+// still emit while a later test captures.
+func (l *eventLog) match(keep func(pineevent.Event) bool) []pineevent.Event {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	var matched []pineevent.Event
 	for _, event := range l.events {
-		if event.Kind == kind {
+		if keep(event) {
 			matched = append(matched, event)
 		}
 	}
 	return matched
+}
+
+func (l *eventLog) routeEvents(kind, routeID string) []pineevent.Event {
+	return l.match(func(event pineevent.Event) bool { return event.Kind == kind && event.RouteID == routeID })
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -764,7 +776,7 @@ func TestDeadRouteIsAvoidedForGrowingPeriods(t *testing.T) {
 		if err := dial(t, r, fmt.Sprintf("r%d-%s.example:443", round, id)); err != nil {
 			t.Fatal(err)
 		}
-		ejected := events.kind("route_ejected")
+		ejected := events.routeEvents("route_ejected", "er_dead_"+id)
 		if len(ejected) != round {
 			t.Fatalf("round %d: %d ejections", round, len(ejected))
 		}
@@ -779,14 +791,14 @@ func TestDeadRouteIsAvoidedForGrowingPeriods(t *testing.T) {
 		if err := dial(t, r, fmt.Sprintf("during-%d-%s.example:443", round, id)); err != nil || dead.dials.Load() != before {
 			t.Fatalf("round %d: ejected route was tried (err %v)", round, err)
 		}
-		waitFor(t, "restore", func() bool { return len(events.kind("route_restored")) == round })
+		waitFor(t, "restore", func() bool { return len(events.routeEvents("route_restored", "er_dead_"+id)) == round })
 	}
 	// Healthy windows (2 × base each) bring k back down.
 	time.Sleep(3 * 2 * base)
 	if err := dial(t, r, "after-healthy-"+id+".example:443"); err != nil {
 		t.Fatal(err)
 	}
-	if last := events.kind("route_ejected"); last[len(last)-1].K != 1 {
+	if last := events.routeEvents("route_ejected", "er_dead_"+id); last[len(last)-1].K != 1 {
 		t.Fatalf("k=%d after healthy windows, want 1", last[len(last)-1].K)
 	}
 }
@@ -808,7 +820,10 @@ func TestNoMoreThanHalfTheRoutesAreEjected(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n := len(events.kind("route_ejected")); n != 2 {
+	ejected := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "route_ejected" && strings.HasSuffix(event.RouteID, "_"+id)
+	})
+	if n := len(ejected); n != 2 {
 		t.Fatalf("%d of 4 routes ejected, want 2", n)
 	}
 	if left := pineroute.WithoutEjected(nodes); len(left) != 2 {
@@ -827,7 +842,10 @@ func TestSingleSiteRefusalNeverEjects(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		_ = dial(t, r, fmt.Sprintf("%s:%d", host, 1000+i))
 	}
-	if n := len(events.kind("route_ejected")); n != 0 {
+	ejected := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "route_ejected" && strings.HasSuffix(event.RouteID, "_"+id)
+	})
+	if n := len(ejected); n != 0 {
 		t.Fatalf("a single-site refusal ejected %d routes", n)
 	}
 }
@@ -852,7 +870,7 @@ func TestEveryRouteCooledStillDials(t *testing.T) {
 // A 1,000-request no_route burst for one destination produces a handful of
 // request events; the browser still sees every failure.
 func TestNoRouteBurstCollapses(t *testing.T) {
-	defer pineroute.SetTimingForTest(time.Minute/2, 3*time.Second)()
+	defer pineroute.SetTimingForTest(time.Minute/2, 1500*time.Millisecond)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
 	host := "storm-" + id + ".example"
@@ -877,8 +895,11 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 	if failures.Load() != 1000 {
 		t.Fatalf("browser saw %d no_route failures, want 1000", failures.Load())
 	}
+	stormRequests := func() []pineevent.Event {
+		return events.match(func(event pineevent.Event) bool { return event.Kind == "request" && event.DestinationHost == host })
+	}
 	waitFor(t, "summary", func() bool {
-		for _, event := range events.kind("request") {
+		for _, event := range stormRequests() {
 			if event.SuppressedCount > 0 {
 				return true
 			}
@@ -886,7 +907,7 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 		return false
 	})
 	var noRoute, suppressed int
-	for _, event := range events.kind("request") {
+	for _, event := range stormRequests() {
 		if event.ErrorClass == "no_route" {
 			noRoute++
 			suppressed += event.SuppressedCount
@@ -899,15 +920,15 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 		t.Fatalf("no_route events=%d suppressed=%d, want 2 and 999", noRoute, suppressed)
 	}
 	var leader, summary pineevent.Event
-	for _, event := range events.kind("request") {
+	for _, event := range stormRequests() {
 		if event.ErrorClass == "no_route" && event.SuppressedCount == 0 {
 			leader = event
 		} else if event.SuppressedCount > 0 {
 			summary = event
 		}
 	}
-	if summary.ObservedAtUnixMS-leader.ObservedAtUnixMS < 3000 {
-		t.Fatalf("summary observed %d ms after the leader, want at the window close (>= 3 s)",
+	if summary.ObservedAtUnixMS-leader.ObservedAtUnixMS < 1500 {
+		t.Fatalf("summary observed %d ms after the leader, want at the window close (>= 1.5 s)",
 			summary.ObservedAtUnixMS-leader.ObservedAtUnixMS)
 	}
 }
@@ -926,7 +947,10 @@ func TestNoRouteFromOtherExclusionsIsNotMerged(t *testing.T) {
 			t.Fatalf("want no_route, got %v", err)
 		}
 	}
-	if n := len(events.kind("request")); n != 5 {
+	filtered := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "request" && event.DestinationHost == "filtered-"+id+".example"
+	})
+	if n := len(filtered); n != 5 {
 		t.Fatalf("%d request events for 5 matcher exclusions, want 5", n)
 	}
 }
