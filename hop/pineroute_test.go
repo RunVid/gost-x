@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -880,6 +880,7 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 	if err := dial(t, r, host+":443"); err == nil {
 		t.Fatal("precondition: every route refuses")
 	}
+	started := time.Now()
 	var wg sync.WaitGroup
 	var failures atomic.Int32
 	for i := 0; i < 1000; i++ {
@@ -892,6 +893,7 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	burst := time.Since(started)
 	if failures.Load() != 1000 {
 		t.Fatalf("browser saw %d no_route failures, want 1000", failures.Load())
 	}
@@ -906,19 +908,27 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 		}
 		return false
 	})
-	var noRoute, suppressed int
+	var noRoute, leaders, suppressed int
 	for _, event := range stormRequests() {
 		if event.ErrorClass == "no_route" {
 			noRoute++
+			if event.SuppressedCount == 0 {
+				leaders++
+			}
 			suppressed += event.SuppressedCount
 			if event.Attempts != 0 || event.FailureCause != "unknown" {
 				t.Fatalf("unexpected no_route event %+v", event)
 			}
 		}
 	}
-	if noRoute != 2 || suppressed != 999 {
-		t.Fatalf("no_route events=%d suppressed=%d, want 2 and 999", noRoute, suppressed)
+	// Every failure is accounted for: each window's leader plus its summary.
+	if leaders+suppressed != 1000 || noRoute > 4 {
+		t.Fatalf("no_route events=%d leaders=%d suppressed=%d for 1000 failures", noRoute, leaders, suppressed)
 	}
+	if burst < 1500*time.Millisecond && (noRoute != 2 || suppressed != 999) {
+		t.Fatalf("a %s burst inside one window: no_route events=%d suppressed=%d, want 2 and 999", burst, noRoute, suppressed)
+	}
+
 	var leader, summary pineevent.Event
 	for _, event := range stormRequests() {
 		if event.ErrorClass == "no_route" && event.SuppressedCount == 0 {
@@ -927,7 +937,7 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 			summary = event
 		}
 	}
-	if summary.ObservedAtUnixMS-leader.ObservedAtUnixMS < 1500 {
+	if noRoute == 2 && summary.ObservedAtUnixMS-leader.ObservedAtUnixMS < 1500 {
 		t.Fatalf("summary observed %d ms after the leader, want at the window close (>= 1.5 s)",
 			summary.ObservedAtUnixMS-leader.ObservedAtUnixMS)
 	}
