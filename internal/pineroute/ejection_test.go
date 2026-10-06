@@ -14,9 +14,14 @@ import (
 	mdx "github.com/go-gost/x/metadata"
 )
 
+type fakeTimer struct {
+	due time.Time
+	f   func()
+}
+
 type fakeEjectionClock struct {
 	now    time.Time
-	timers []func()
+	timers []fakeTimer
 	events []RouteEvent
 }
 
@@ -25,17 +30,25 @@ func newTestEjectionStore(t *testing.T, limit int) (*ejectionStore, *fakeEjectio
 	clock := &fakeEjectionClock{now: time.Unix(1_700_000_000, 0)}
 	store := newEjectionStore(limit, defaultEjectionBase)
 	store.now = func() time.Time { return clock.now }
-	store.after = func(_ time.Duration, f func()) { clock.timers = append(clock.timers, f) }
+	store.after = func(d time.Duration, f func()) { clock.timers = append(clock.timers, fakeTimer{clock.now.Add(d), f}) }
 	store.jitter = func(time.Duration) time.Duration { return 0 }
 	store.emit = func(event RouteEvent) { clock.events = append(clock.events, event) }
 	return store, clock
 }
 
-// fire runs the pending restore timers.
+// fire runs the restore timers that are due.
 func (c *fakeEjectionClock) fire() {
-	timers := c.timers
-	c.timers = nil
-	for _, f := range timers {
+	var pending []fakeTimer
+	var due []func()
+	for _, timer := range c.timers {
+		if timer.due.After(c.now) {
+			pending = append(pending, timer)
+		} else {
+			due = append(due, timer.f)
+		}
+	}
+	c.timers = pending
+	for _, f := range due {
 		f()
 	}
 }

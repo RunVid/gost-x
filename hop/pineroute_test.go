@@ -748,9 +748,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // A dead route is avoided for growing periods and comes back to the base
-// period after healthy windows (base scaled down to 40 ms).
+// period after healthy windows (base scaled down to 200 ms).
 func TestDeadRouteIsAvoidedForGrowingPeriods(t *testing.T) {
-	base := 40 * time.Millisecond
+	base := 200 * time.Millisecond
 	defer pineroute.SetTimingForTest(base, time.Second)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())

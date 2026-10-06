@@ -17,11 +17,12 @@ import (
 const (
 	noRouteMergeWindow = 10 * time.Second
 	noRouteMergeLimit  = 1024
-	// maxSuppressedPerSummary keeps a summary inside the coordinator's
-	// accepted range; a window that reaches it reports a summary at once and
-	// keeps counting.
-	maxSuppressedPerSummary = 1_000_000
 )
+
+// maxSuppressedPerSummary keeps a summary inside the coordinator's accepted
+// range (1,000,000); a window that reaches it reports a summary at once and
+// keeps counting. A variable only so tests can use a small bound.
+var maxSuppressedPerSummary = 1_000_000
 
 type noRouteWindow struct {
 	// last is the payload of the latest suppressed failure.

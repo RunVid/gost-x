@@ -352,11 +352,15 @@ func (c *refusalCache) add(route routeKey, network, address string, class refusa
 }
 
 // evictLocked drops forgotten entries, then the one forgotten soonest.
+// Without Escalation nothing is remembered past its expiry (#7).
 func (c *refusalCache) evictLocked(now time.Time) {
 	var oldestKey endpointKey
 	var oldest time.Time
 	for k, entry := range c.entries {
 		forget := entry.expires.Add(entry.ttl)
+		if !Escalation {
+			forget = entry.expires
+		}
 		if !now.Before(forget) {
 			delete(c.entries, k)
 			continue
@@ -381,7 +385,7 @@ func (c *refusalCache) contains(route routeKey, network, address string, now tim
 	if !ok {
 		return false
 	}
-	if entry.forgotten(now) {
+	if entry.forgotten(now) || !Escalation && !now.Before(entry.expires) {
 		delete(c.entries, key)
 		return false
 	}

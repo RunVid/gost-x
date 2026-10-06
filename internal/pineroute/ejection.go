@@ -85,7 +85,13 @@ func SetRouteEventSink(sink func(RouteEvent)) {
 	routeEventSink.Store(&sink)
 }
 
+// emitRouteEvent reports route events only with Escalation, so the switched-off
+// mode emits exactly what #8 did (nothing) and older coordinators never see
+// the new kinds.
 func emitRouteEvent(event RouteEvent) {
+	if !Escalation {
+		return
+	}
 	if sink := routeEventSink.Load(); sink != nil {
 		(*sink)(event)
 	}
@@ -246,6 +252,16 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 	record := s.recordLocked(route, now)
 	if record == nil {
 		s.mu.Unlock()
+		return false
+	}
+	if !Escalation && record.until.After(now) {
+		// #8: fresh evidence renews the fixed quarantine.
+		record.until, record.lastBad = now.Add(s.base), now
+		s.generation++
+		record.generation = s.generation
+		generation := record.generation
+		s.mu.Unlock()
+		s.after(s.base, func() { s.restore(route, generation) })
 		return false
 	}
 	if record.until.After(now) || Escalation && !s.withinCapLocked(route, hop, now) {

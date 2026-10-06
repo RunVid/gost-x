@@ -99,6 +99,11 @@ func TestNoRouteMergeDisabledOutsidePine(t *testing.T) {
 }
 
 func TestNoRouteSummaryStaysWithinTheCoordinatorsBound(t *testing.T) {
+	if maxSuppressedPerSummary != 1_000_000 {
+		t.Fatal("the summary bound must match the coordinator's maxSuppressedCount")
+	}
+	maxSuppressedPerSummary = 1000
+	defer func() { maxSuppressedPerSummary = 1_000_000 }()
 	merger, timers := newTestMerger(8)
 	var flushed []int
 	flush := func(_ any, n int) { flushed = append(flushed, n) }
