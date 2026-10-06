@@ -431,8 +431,8 @@ func TestRefusalWhileExcludedDoesNotEscalate(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	cache.add(route, "tcp", "x.example:443", classTransient, now)
 	cache.add(route, "tcp", "x.example:443", classTransient, now.Add(time.Second))
-	if entry := cache.entries[key]; entry.ttl != transientTTL || !entry.expires.Equal(now.Add(transientTTL)) {
-		t.Fatalf("a concurrent duplicate changed the entry: %+v", entry)
+	if entry := cache.entries[key]; entry.ttl != transientTTL || !entry.expires.Equal(now.Add(time.Second+transientTTL)) {
+		t.Fatalf("a concurrent duplicate should keep the later expiry without doubling: %+v", entry)
 	}
 	// A policy refusal replaces a live transient entry at the policy base.
 	cache.add(route, "tcp", "x.example:443", classPolicy, now.Add(2*time.Second))

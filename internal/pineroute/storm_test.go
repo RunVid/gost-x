@@ -97,3 +97,16 @@ func TestNoRouteMergeDisabledOutsidePine(t *testing.T) {
 		}
 	}
 }
+
+func TestNoRouteSummaryStaysWithinTheCoordinatorsBound(t *testing.T) {
+	merger, timers := newTestMerger(8)
+	var flushed []int
+	flush := func(_ any, n int) { flushed = append(flushed, n) }
+	for i := 0; i < maxSuppressedPerSummary+11; i++ {
+		merger.merge("tcp", "huge.example:443", i, flush)
+	}
+	(*timers)[0]()
+	if len(flushed) != 2 || flushed[0] != maxSuppressedPerSummary || flushed[1] != 10 {
+		t.Fatalf("summaries %v, want [%d 10]", flushed, maxSuppressedPerSummary)
+	}
+}

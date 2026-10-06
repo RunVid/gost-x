@@ -305,11 +305,13 @@ func refusalKey(route routeKey, network, address string) (endpointKey, bool) {
 	return endpointKey{route: route, network: network, address: net.JoinHostPort(host, strconv.FormatUint(p, 10))}, true
 }
 
-// add records a refusal of class for the pair. While the pair is excluded a
-// refusal (from a CONNECT that began before the entry existed) changes
-// nothing, except that a policy refusal replaces a transient entry. After
-// the exclusion ends, a refusal of the same class doubles the previous TTL up
-// to the class's cap; otherwise the class's base applies.
+// add records a refusal of class for the pair. While the pair is excluded, a
+// refusal (from a CONNECT that began before the entry existed) does not
+// escalate: the same class keeps the later expiry at the current TTL, a
+// policy refusal replaces a transient entry at the policy base, and a
+// transient refusal never shortens a policy entry. After the exclusion ends,
+// a refusal of the same class doubles the previous TTL up to the class's
+// cap; otherwise the class's base applies.
 func (c *refusalCache) add(route routeKey, network, address string, class refusalClass, now time.Time) {
 	key, ok := refusalKey(route, network, address)
 	if !ok || c.limit <= 0 {
@@ -321,7 +323,13 @@ func (c *refusalCache) add(route routeKey, network, address string, class refusa
 	ttl := base
 	if previous, ok := c.entries[key]; ok && !previous.forgotten(now) {
 		switch {
-		case now.Before(previous.expires) && (previous.class == class || class == classTransient):
+		case now.Before(previous.expires) && previous.class == class:
+			if expires := now.Add(previous.ttl); expires.After(previous.expires) {
+				previous.expires = expires
+				c.entries[key] = previous
+			}
+			return
+		case now.Before(previous.expires) && class == classTransient:
 			return
 		case now.Before(previous.expires):
 			// A policy refusal while a transient entry is live starts the

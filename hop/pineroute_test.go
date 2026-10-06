@@ -851,7 +851,7 @@ func TestEveryRouteCooledStillDials(t *testing.T) {
 // A 1,000-request no_route burst for one destination produces a handful of
 // request events; the browser still sees every failure.
 func TestNoRouteBurstCollapses(t *testing.T) {
-	defer pineroute.SetTimingForTest(time.Minute/2, 100*time.Millisecond)()
+	defer pineroute.SetTimingForTest(time.Minute/2, 3*time.Second)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
 	host := "storm-" + id + ".example"
@@ -905,8 +905,8 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 			summary = event
 		}
 	}
-	if summary.ObservedAtUnixMS-leader.ObservedAtUnixMS < 100 {
-		t.Fatalf("summary observed %d ms after the leader, want at the window close (>= 100 ms)",
+	if summary.ObservedAtUnixMS-leader.ObservedAtUnixMS < 3000 {
+		t.Fatalf("summary observed %d ms after the leader, want at the window close (>= 3 s)",
 			summary.ObservedAtUnixMS-leader.ObservedAtUnixMS)
 	}
 }

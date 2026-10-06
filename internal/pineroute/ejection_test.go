@@ -367,3 +367,25 @@ func TestPanicSelectOrder(t *testing.T) {
 		t.Fatal("panic selection ran outside Pine")
 	}
 }
+
+// Evidence below the ejection threshold must not erase healthy time already
+// earned: an old ejection decays before new charges move the clock.
+func TestChargesAfterALongHealthyPeriodDoNotKeepOldK(t *testing.T) {
+	store, clock := newTestEjectionStore(t, 16)
+	hop := testHop(4)
+	route := hop[0]
+	for i := 0; i < 3; i++ {
+		store.eject(route, routeInfo{}, hop, ReasonDestinationFailures)
+		clock.now = clock.now.Add(store.entries[route].ttl)
+		clock.fire()
+	}
+	clock.now = clock.now.Add(3 * time.Hour)
+	store.noteBad(route)
+	clock.now = clock.now.Add(10 * time.Second)
+	store.noteBad(route)
+	clock.now = clock.now.Add(10 * time.Second)
+	store.eject(route, routeInfo{}, hop, ReasonDestinationFailures)
+	if got := clock.events[len(clock.events)-1]; got.K != 1 {
+		t.Fatalf("k=%d after three healthy hours, want 1", got.K)
+	}
+}

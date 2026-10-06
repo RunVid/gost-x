@@ -201,7 +201,26 @@ func (s *ejectionStore) noteBad(route incarnation) {
 	defer s.mu.Unlock()
 	now := s.now()
 	if record := s.recordLocked(route, now); record != nil {
+		if !record.until.After(now) {
+			s.decayLocked(record, now)
+		}
 		record.lastBad = now
+	}
+}
+
+// decayLocked takes one off k per healthy window completed since the last
+// evidence or the end of the last ejection, and restarts the count from now
+// so a window is never applied twice.
+func (s *ejectionStore) decayLocked(record *ejectionRecord, now time.Time) {
+	if record.k == 0 || s.healthy <= 0 {
+		return
+	}
+	since := record.lastBad
+	if record.until.After(since) {
+		since = record.until
+	}
+	if windows := int(now.Sub(since) / s.healthy); windows > 0 {
+		record.k = max(0, record.k-windows)
 	}
 }
 
@@ -224,15 +243,7 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 		s.mu.Unlock()
 		return false
 	}
-	if record.k > 0 && s.healthy > 0 {
-		since := record.lastBad
-		if record.until.After(since) {
-			since = record.until
-		}
-		if windows := int(now.Sub(since) / s.healthy); windows > 0 {
-			record.k = max(0, record.k-windows)
-		}
-	}
+	s.decayLocked(record, now)
 	record.k = min(record.k+1, maxEjectionK)
 	ttl := min(time.Duration(record.k)*s.base, s.max)
 	ttl += s.jitter(ttl / 10)

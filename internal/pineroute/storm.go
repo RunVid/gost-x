@@ -17,6 +17,10 @@ import (
 const (
 	noRouteMergeWindow = 10 * time.Second
 	noRouteMergeLimit  = 1024
+	// maxSuppressedPerSummary keeps a summary inside the coordinator's
+	// accepted range; a window that reaches it reports a summary at once and
+	// keeps counting.
+	maxSuppressedPerSummary = 1_000_000
 )
 
 type noRouteWindow struct {
@@ -97,12 +101,20 @@ func (m *noRouteMerger) merge(network, address string, payload any, flush func(a
 	}
 	id := key.network + "/" + key.address
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if window := m.windows[id]; window != nil {
 		window.last = payload
 		window.suppressed++
+		if window.suppressed < maxSuppressedPerSummary {
+			m.mu.Unlock()
+			return false
+		}
+		last, suppressed := window.last, window.suppressed
+		window.suppressed = 0
+		m.mu.Unlock()
+		window.flush(last, suppressed)
 		return false
 	}
+	defer m.mu.Unlock()
 	if len(m.windows) >= m.limit {
 		return true
 	}
