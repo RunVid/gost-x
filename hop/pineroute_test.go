@@ -13,6 +13,7 @@ import (
 	corechain "github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
 	xchain "github.com/go-gost/x/chain"
+	"github.com/go-gost/x/internal/pineevent"
 	"github.com/go-gost/x/internal/pineroute"
 	xlogger "github.com/go-gost/x/logger"
 	mdx "github.com/go-gost/x/metadata"
@@ -405,14 +406,12 @@ func TestUpstreamReplyDoesNotPoisonDestinationCache(t *testing.T) {
 			if primary.Marker().Count() != 1 {
 				t.Fatal("upstream failure did not cool the proxy")
 			}
-			// Simulate the proxy recovering after its route cooldown. There
-			// must be no independent destination refusal left behind.
-			broken.dialErr, broken.handshakeErr = nil, nil
-			primary.Marker().Reset()
-			if err := dial(t, r, host+":443"); err != nil {
-				t.Fatal(err)
+			if !pineroute.Ejected(primary) {
+				t.Fatal("an upstream failure did not eject the route")
 			}
-			if broken.connects.Load() != 1 || healthy.connects.Load() != 1 {
+			// There must be no independent destination refusal left behind
+			// once the route recovers.
+			if pineroute.Skip(pineroute.WithAttempts(context.Background()), primary, "tcp", host+":443") {
 				t.Fatal("upstream failure was incorrectly cached against the destination")
 			}
 		})
@@ -438,7 +437,7 @@ const escalationHosts = 3
 
 // Production pattern 2026-10-04: one Oxylabs session answered reply 4 after
 // ~3 s for every host, so each new host on the Computer waited for it first.
-func TestRouteFailingReachableHostsIsQuarantined(t *testing.T) {
+func TestRouteFailingReachableHostsIsEjected(t *testing.T) {
 	for _, reply := range []uint8{3, 4, 5, 6} {
 		t.Run(fmt.Sprint(reply), func(t *testing.T) {
 			id := fmt.Sprintf("%d-%d", reply, time.Now().UnixNano())
@@ -453,7 +452,7 @@ func TestRouteFailingReachableHostsIsQuarantined(t *testing.T) {
 				}
 			}
 			if broken.connects.Load() != escalationHosts || primary.Marker().Count() != 0 {
-				t.Fatalf("primary connects=%d marker=%d before quarantine", broken.connects.Load(), primary.Marker().Count())
+				t.Fatalf("primary connects=%d marker=%d before ejection", broken.connects.Load(), primary.Marker().Count())
 			}
 			for i := 0; i < 5; i++ {
 				if err := dial(t, r, fmt.Sprintf("next-%d-%s.example:443", i, id)); err != nil {
@@ -461,7 +460,7 @@ func TestRouteFailingReachableHostsIsQuarantined(t *testing.T) {
 				}
 			}
 			if broken.connects.Load() != escalationHosts {
-				t.Fatal("quarantined route was still tried first for new hosts")
+				t.Fatal("ejected route was still tried first for new hosts")
 			}
 			if second.connects.Load() != escalationHosts+5 {
 				t.Fatalf("second primary served %d, want %d", second.connects.Load(), escalationHosts+5)
@@ -501,8 +500,8 @@ func TestDestinationsNoRouteReachesAreNotCharged(t *testing.T) {
 }
 
 // Provider policy refusals (ads, restricted targets) and address-family errors
-// are about the destination and never quarantine a route.
-func TestPolicyAndAddressFamilyRefusalsNeverQuarantine(t *testing.T) {
+// are about the destination and never ejection a route.
+func TestPolicyAndAddressFamilyRefusalsNeverEject(t *testing.T) {
 	for _, reply := range []uint8{2, 8} {
 		t.Run(fmt.Sprint(reply), func(t *testing.T) {
 			id := fmt.Sprintf("%d-%d", reply, time.Now().UnixNano())
@@ -521,7 +520,7 @@ func TestPolicyAndAddressFamilyRefusalsNeverQuarantine(t *testing.T) {
 }
 
 // Repeated failures for one host are one piece of evidence, not three.
-func TestRepeatedHostDoesNotQuarantine(t *testing.T) {
+func TestRepeatedHostDoesNotEject(t *testing.T) {
 	id := fmt.Sprint(time.Now().UnixNano())
 	host := "flaky-" + id + ".example"
 	primary := &refusingTransport{refused: map[string]error{host: socksReply(4)}}
@@ -536,13 +535,13 @@ func TestRepeatedHostDoesNotQuarantine(t *testing.T) {
 		t.Fatal(err)
 	}
 	if primary.connects.Load() != before+1 {
-		t.Fatal("one failing host quarantined the whole route")
+		t.Fatal("one failing host ejected the whole route")
 	}
 }
 
-// Routes with complementary reachability charge each other until both are
-// quarantined. Quarantine must never leave a request without a route: with
-// every route quarantined, selection falls back to the full set.
+// Routes with complementary reachability charge each other. Ejection must
+// never leave a request without a route: the cap stops the second ejection,
+// and selection falls back to the full set anyway.
 func TestComplementaryRoutesNeverBlackOut(t *testing.T) {
 	id := fmt.Sprint(time.Now().UnixNano())
 	aRefuses, bRefuses := map[string]error{}, map[string]error{}
@@ -560,8 +559,10 @@ func TestComplementaryRoutesNeverBlackOut(t *testing.T) {
 			}
 		}
 	}
-	if left := pineroute.WithoutQuarantined([]*corechain.Node{aNode, bNode}); left == nil || len(left) != 0 {
-		t.Fatalf("precondition: both routes should be quarantined, %d left", len(left))
+	// The cap keeps at least half of the routes: only one of the two is
+	// ejected, whichever collected its third host first.
+	if left := pineroute.WithoutEjected([]*corechain.Node{aNode, bNode}); left == nil || len(left) != 1 {
+		t.Fatalf("want exactly one of two routes ejected, %d left", len(left))
 	}
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
@@ -569,24 +570,24 @@ func TestComplementaryRoutesNeverBlackOut(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			if err := dial(t, r, fmt.Sprintf("shared-%d-%s.example:443", i, id)); err != nil {
-				t.Errorf("quarantine blacked out the Computer: %v", err)
+				t.Errorf("ejection blacked out the Computer: %v", err)
 			}
 		}(i)
 	}
 	wg.Wait()
 }
 
-// A quarantined route that still works must win over a preferred route that
+// A ejected route that still works must win over a preferred route that
 // is in its failure cooldown, even when that route is the only preferred one.
-func TestCooledPreferredRouteDoesNotBeatUsableQuarantinedRoute(t *testing.T) {
+func TestCooledPreferredRouteDoesNotBeatUsableEjectedRoute(t *testing.T) {
 	id := fmt.Sprint(time.Now().UnixNano())
 	refused := map[string]error{}
 	for i := 0; i < 3; i++ {
 		refused[fmt.Sprintf("q-%d-%s.example", i, id)] = socksReply(4)
 	}
-	quarantined := &refusingTransport{refused: refused}
+	ejected := &refusingTransport{refused: refused}
 	cooled := &refusingTransport{}
-	r := newTestRouter(pineNode("er_q_"+id, quarantined), pineNode("er_cooled_"+id, cooled))
+	r := newTestRouter(pineNode("er_q_"+id, ejected), pineNode("er_cooled_"+id, cooled))
 	for host := range refused {
 		if err := dial(t, r, host+":443"); err != nil {
 			t.Fatal(err)
@@ -594,7 +595,7 @@ func TestCooledPreferredRouteDoesNotBeatUsableQuarantinedRoute(t *testing.T) {
 	}
 	cooled.handshakeErr = errors.New("proxy authentication failed")
 	if err := dial(t, r, "first-"+id+".example:443"); err != nil {
-		t.Fatalf("quarantined route did not serve after the preferred route failed: %v", err)
+		t.Fatalf("ejected route did not serve after the preferred route failed: %v", err)
 	}
 	before := cooled.dials.Load()
 	for i := 0; i < 3; i++ {
@@ -603,13 +604,13 @@ func TestCooledPreferredRouteDoesNotBeatUsableQuarantinedRoute(t *testing.T) {
 		}
 	}
 	if cooled.dials.Load() != before {
-		t.Fatal("a route in failure cooldown was dialed ahead of a usable quarantined route")
+		t.Fatal("a route in failure cooldown was dialed ahead of a usable ejected route")
 	}
 }
 
 // A lone preferred route is judged by the selector's own cooldown rules: once
 // its cooldown has expired, or while it is below maxFails, it is still
-// preferred over a quarantined route even though its failure count is non-zero.
+// preferred over a ejected route even though its failure count is non-zero.
 func TestLonePreferredRouteFollowsSelectorCooldown(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -626,10 +627,10 @@ func TestLonePreferredRouteFollowsSelectorCooldown(t *testing.T) {
 			for i := 0; i < 3; i++ {
 				refused[fmt.Sprintf("q-%d-%s.example", i, id)] = socksReply(4)
 			}
-			quarantined := &refusingTransport{refused: refused}
+			ejected := &refusingTransport{refused: refused}
 			preferred := &refusingTransport{}
 			preferredNode := pineNode("er_pref_"+id, preferred)
-			r := newTestRouterWithFailFilter(tc.maxFails, tc.failTimeout, pineNode("er_quar_"+id, quarantined), preferredNode)
+			r := newTestRouterWithFailFilter(tc.maxFails, tc.failTimeout, pineNode("er_quar_"+id, ejected), preferredNode)
 			for host := range refused {
 				if err := dial(t, r, host+":443"); err != nil {
 					t.Fatal(err)
@@ -644,21 +645,21 @@ func TestLonePreferredRouteFollowsSelectorCooldown(t *testing.T) {
 				t.Fatal("precondition: preferred route should carry a failure")
 			}
 			time.Sleep(tc.wait)
-			quarantinedBefore, preferredBefore := quarantined.connects.Load(), preferred.connects.Load()
+			ejectedBefore, preferredBefore := ejected.connects.Load(), preferred.connects.Load()
 			if err := dial(t, r, "next-"+id+".example:443"); err != nil {
 				t.Fatal(err)
 			}
-			if quarantined.connects.Load() != quarantinedBefore || preferred.connects.Load() != preferredBefore+1 {
-				t.Fatalf("quarantined=%d preferred=%d: an eligible preferred route lost to quarantine",
-					quarantined.connects.Load()-quarantinedBefore, preferred.connects.Load()-preferredBefore)
+			if ejected.connects.Load() != ejectedBefore || preferred.connects.Load() != preferredBefore+1 {
+				t.Fatalf("ejected=%d preferred=%d: an eligible preferred route lost to ejection",
+					ejected.connects.Load()-ejectedBefore, preferred.connects.Load()-preferredBefore)
 			}
 		})
 	}
 }
 
-// Quarantine outranks the backup flag: a healthy fallback serves before a
-// quarantined primary.
-func TestQuarantinedPrimaryYieldsToBackup(t *testing.T) {
+// Ejection outranks the backup flag: a healthy fallback serves before a
+// ejected primary.
+func TestEjectedPrimaryYieldsToBackup(t *testing.T) {
 	id := fmt.Sprint(time.Now().UnixNano())
 	refused := map[string]error{}
 	for i := 0; i < 3; i++ {
@@ -677,13 +678,13 @@ func TestQuarantinedPrimaryYieldsToBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if primary.connects.Load() != before || backup.connects.Load() != 4 {
-		t.Fatalf("primary=%d backup=%d after quarantine", primary.connects.Load()-before, backup.connects.Load())
+		t.Fatalf("primary=%d backup=%d after ejection", primary.connects.Load()-before, backup.connects.Load())
 	}
 }
 
-// Explicit-country plans have no direct node. A quarantined single route must
+// Explicit-country plans have no direct node. A ejected single route must
 // still be used rather than failing the request.
-func TestQuarantinedOnlyRouteIsStillUsed(t *testing.T) {
+func TestEjectedOnlyRouteIsStillUsed(t *testing.T) {
 	id := fmt.Sprint(time.Now().UnixNano())
 	refused := map[string]error{}
 	for i := 0; i < 3; i++ {
@@ -700,6 +701,199 @@ func TestQuarantinedOnlyRouteIsStillUsed(t *testing.T) {
 	}
 	solo := newTestRouter(onlyNode)
 	if err := dial(t, solo, "solo-"+id+".example:443"); err != nil {
-		t.Fatalf("quarantined sole route was not used: %v", err)
+		t.Fatalf("ejected sole route was not used: %v", err)
+	}
+}
+
+type eventLog struct {
+	mu     sync.Mutex
+	events []pineevent.Event
+}
+
+func captureEvents(t *testing.T) *eventLog {
+	t.Helper()
+	log := &eventLog{}
+	restore := pineevent.CaptureForTest(func(event pineevent.Event) {
+		log.mu.Lock()
+		log.events = append(log.events, event)
+		log.mu.Unlock()
+	})
+	t.Cleanup(restore)
+	return log
+}
+
+func (l *eventLog) kind(kind string) []pineevent.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var matched []pineevent.Event
+	for _, event := range l.events {
+		if event.Kind == kind {
+			matched = append(matched, event)
+		}
+	}
+	return matched
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A dead route is avoided for growing periods and comes back to the base
+// period after healthy windows (base scaled down to 40 ms).
+func TestDeadRouteIsAvoidedForGrowingPeriods(t *testing.T) {
+	base := 40 * time.Millisecond
+	defer pineroute.SetTimingForTest(base, time.Second)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	dead := &refusingTransport{dialErr: errors.New("connection refused by proxy")}
+	healthy := &refusingTransport{}
+	deadNode := pineNode("er_dead_"+id, dead)
+	deadNode.Options().Metadata = mdx.NewMetadata(map[string]any{"pine_route_id": "er_dead_" + id, "pine_tier": "primary", "pine_source_list_id": "epl_dead"})
+	// FailFilter's own cooldown is kept short so the ejection is what we see.
+	r := newTestRouterWithFailFilter(1, time.Millisecond, deadNode, pineNode("er_ok_"+id, healthy))
+	for round := 1; round <= 3; round++ {
+		if err := dial(t, r, fmt.Sprintf("r%d-%s.example:443", round, id)); err != nil {
+			t.Fatal(err)
+		}
+		ejected := events.kind("route_ejected")
+		if len(ejected) != round {
+			t.Fatalf("round %d: %d ejections", round, len(ejected))
+		}
+		got := ejected[round-1]
+		want := time.Duration(round) * base
+		if got.RouteID != "er_dead_"+id || got.K != round || got.Reason != "connect_error" || got.Tier != "primary" ||
+			got.SourceListID != "epl_dead" || got.RouteKind != "managed" ||
+			got.TTLMS < want.Milliseconds() || got.TTLMS > (want+want/10).Milliseconds() {
+			t.Fatalf("round %d: %+v, want k=%d ttl≈%s", round, got, round, want)
+		}
+		before := dead.dials.Load()
+		if err := dial(t, r, fmt.Sprintf("during-%d-%s.example:443", round, id)); err != nil || dead.dials.Load() != before {
+			t.Fatalf("round %d: ejected route was tried (err %v)", round, err)
+		}
+		waitFor(t, "restore", func() bool { return len(events.kind("route_restored")) == round })
+	}
+	// Healthy windows (2 × base each) bring k back down.
+	time.Sleep(3 * 2 * base)
+	if err := dial(t, r, "after-healthy-"+id+".example:443"); err != nil {
+		t.Fatal(err)
+	}
+	if last := events.kind("route_ejected"); last[len(last)-1].K != 1 {
+		t.Fatalf("k=%d after healthy windows, want 1", last[len(last)-1].K)
+	}
+}
+
+// Never more than half of a hop's routes are ejected, however many are dead.
+func TestNoMoreThanHalfTheRoutesAreEjected(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Second)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	var nodes []*corechain.Node
+	for i := 0; i < 3; i++ {
+		nodes = append(nodes, pineNode(fmt.Sprintf("er_dead%d_%s", i, id), &refusingTransport{handshakeErr: errors.New("reset")}))
+	}
+	healthy := &refusingTransport{}
+	nodes = append(nodes, pineNode("er_alive_"+id, healthy))
+	r := newTestRouter(nodes...)
+	for i := 0; i < 5; i++ {
+		if err := dial(t, r, fmt.Sprintf("h%d-%s.example:443", i, id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(events.kind("route_ejected")); n != 2 {
+		t.Fatalf("%d of 4 routes ejected, want 2", n)
+	}
+	if left := pineroute.WithoutEjected(nodes); len(left) != 2 {
+		t.Fatalf("%d routes left, want 2", len(left))
+	}
+}
+
+// A destination refusing every route is that site's problem: the routes stay.
+func TestSingleSiteRefusalNeverEjects(t *testing.T) {
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	host := "one-site-" + id + ".example"
+	a := &refusingTransport{refused: map[string]error{host: socksReply(4)}}
+	b := &refusingTransport{refused: map[string]error{host: socksReply(5)}}
+	r := newTestRouter(pineNode("er_site_a_"+id, a), pineNode("er_site_b_"+id, b))
+	for i := 0; i < 50; i++ {
+		_ = dial(t, r, fmt.Sprintf("%s:%d", host, 1000+i))
+	}
+	if n := len(events.kind("route_ejected")); n != 0 {
+		t.Fatalf("a single-site refusal ejected %d routes", n)
+	}
+}
+
+// When every route is cooling down, a request still tries one rather than
+// failing with no route (explicit plan: no direct node).
+func TestEveryRouteCooledStillDials(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Second)()
+	id := fmt.Sprint(time.Now().UnixNano())
+	a := &refusingTransport{handshakeErr: errors.New("reset")}
+	b := &refusingTransport{handshakeErr: errors.New("reset")}
+	r := newTestRouter(pineNode("er_cool_a_"+id, a), pineNode("er_cool_b_"+id, b))
+	if err := dial(t, r, "first-"+id+".example:443"); err == nil {
+		t.Fatal("precondition: both routes should fail")
+	}
+	a.handshakeErr, b.handshakeErr = nil, nil
+	if err := dial(t, r, "second-"+id+".example:443"); err != nil {
+		t.Fatalf("every route cooled produced %v instead of a panic attempt", err)
+	}
+}
+
+// A 1,000-request no_route burst for one destination produces a handful of
+// request events; the browser still sees every failure.
+func TestNoRouteBurstCollapses(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, 100*time.Millisecond)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	host := "storm-" + id + ".example"
+	r := newTestRouter(
+		pineNode("er_storm_a_"+id, &refusingTransport{refused: map[string]error{host: socksReply(2)}}),
+		pineNode("er_storm_b_"+id, &refusingTransport{refused: map[string]error{host: socksReply(2)}}))
+	if err := dial(t, r, host+":443"); err == nil {
+		t.Fatal("precondition: every route refuses")
+	}
+	var wg sync.WaitGroup
+	var failures atomic.Int32
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := dial(t, r, host+":443"); errors.Is(err, pineroute.ErrNoRoute) {
+				failures.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if failures.Load() != 1000 {
+		t.Fatalf("browser saw %d no_route failures, want 1000", failures.Load())
+	}
+	waitFor(t, "summary", func() bool {
+		for _, event := range events.kind("request") {
+			if event.SuppressedCount > 0 {
+				return true
+			}
+		}
+		return false
+	})
+	var noRoute, suppressed int
+	for _, event := range events.kind("request") {
+		if event.ErrorClass == "no_route" {
+			noRoute++
+			suppressed += event.SuppressedCount
+			if event.Attempts != 0 || event.FailureCause != "unknown" {
+				t.Fatalf("unexpected no_route event %+v", event)
+			}
+		}
+	}
+	if noRoute != 2 || suppressed != 999 {
+		t.Fatalf("no_route events=%d suppressed=%d, want 2 and 999", noRoute, suppressed)
 	}
 }

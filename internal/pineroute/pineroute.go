@@ -7,9 +7,10 @@
 // A managed route that keeps failing destinations which another route then
 // reaches at the same address is itself broken, for example a residential
 // exit that answers "host unreachable" for everything. Once that happens for
-// enough distinct hosts in a short window, the route is quarantined: selection
-// prefers the other routes while any of them is usable, and falls back to the
-// quarantined route rather than failing when none is.
+// enough distinct hosts in a short window, the route is ejected (see
+// ejection.go): selection prefers the other routes while any of them is
+// usable, and falls back to the ejected route rather than failing when none
+// is.
 package pineroute
 
 import (
@@ -30,13 +31,24 @@ import (
 const (
 	replyNotAllowed = 2
 
+	// A repeated refusal of the same route and destination doubles the TTL
+	// up to the class's cap; a success for the pair resets it.
 	refusalTTL        = 10 * time.Minute
+	refusalTTLCap     = 6 * time.Hour
 	transientTTL      = 30 * time.Second
+	transientTTLCap   = 10 * time.Minute
 	refusalCacheLimit = 4096
+	escalationWindow  = 30 * time.Second
+	escalationHosts   = 3
+)
 
-	escalationWindow = 30 * time.Second
-	escalationHosts  = 3
-	quarantineTTL    = 30 * time.Second
+// refusalClass separates vendor policy refusals from transient destination
+// failures; each doubles from its own base.
+type refusalClass uint8
+
+const (
+	classTransient refusalClass = iota
+	classPolicy
 )
 
 // ErrNoRoute reports that every configured route was excluded for a request.
@@ -158,7 +170,10 @@ type attempts struct {
 	tried    map[routeKey]struct{}
 	suspects []suspect
 	records  []attemptRecord
-	request  context.Context
+	// hops maps each managed route seen by this request's hop selection to
+	// the hop's managed routes, for the ejection cap.
+	hops    map[incarnation][]incarnation
+	request context.Context
 }
 
 // WithAttempts returns a context that tracks the routes tried by one router
@@ -212,24 +227,53 @@ func Skip(ctx context.Context, node *chain.Node, network, address string) bool {
 
 // RecordRefusal remembers a destination failure. Cancellation is not cached.
 // Transient failures recover quickly; repeated cache hits never renew a TTL.
+// A refusal of a pair whose entry expired but is still remembered doubles
+// the TTL.
 func RecordRefusal(ctx context.Context, node *chain.Node, network, address string, err error) {
 	if !IgnoreFailure(ctx, node, network, err) || RequestCanceled(ctx, err) {
 		return
 	}
-	ttl := transientTTL
+	class := classTransient
 	var reply socks5ReplyError
 	if errors.As(err, &reply) && reply.SOCKS5ReplyCode() == replyNotAllowed {
-		ttl = refusalTTL
+		class = classPolicy
 	}
 	if id := nodeRouteKey(node); id != (routeKey{}) {
-		defaultRefusals.add(id, network, address, ttl, time.Now())
+		defaultRefusals.add(id, network, address, class, time.Now())
+	}
+}
+
+// RecordSuccess forgets the refusal history of a pair the route just reached.
+func RecordSuccess(ctx context.Context, node *chain.Node, network, address string) {
+	if !Enabled || !Tracking(ctx) {
+		return
+	}
+	if id := nodeRouteKey(node); id != (routeKey{}) {
+		defaultRefusals.remove(id, network, address)
 	}
 }
 
 type refusalCache struct {
 	mu      sync.Mutex
-	entries map[endpointKey]time.Time
+	entries map[endpointKey]refusalEntry
 	limit   int
+}
+
+// refusalEntry excludes its pair until expires. It is remembered for one more
+// ttl after that, so a repeat refusal can be recognised and doubled.
+type refusalEntry struct {
+	expires time.Time
+	ttl     time.Duration
+	class   refusalClass
+}
+
+func (e refusalEntry) forgotten(now time.Time) bool { return !now.Before(e.expires.Add(e.ttl)) }
+
+func classTTL(class refusalClass) (base, limit time.Duration) {
+	if class == classPolicy {
+		return refusalTTL, refusalTTLCap
+	}
+	return transientTTL, transientTTLCap
 }
 
 type endpointKey struct {
@@ -241,7 +285,7 @@ type endpointKey struct {
 var defaultRefusals = newRefusalCache(refusalCacheLimit)
 
 func newRefusalCache(limit int) *refusalCache {
-	return &refusalCache{entries: map[endpointKey]time.Time{}, limit: limit}
+	return &refusalCache{entries: map[endpointKey]refusalEntry{}, limit: limit}
 }
 
 func refusalKey(route routeKey, network, address string) (endpointKey, bool) {
@@ -259,30 +303,53 @@ func refusalKey(route routeKey, network, address string) (endpointKey, bool) {
 	return endpointKey{route: route, network: network, address: net.JoinHostPort(host, strconv.FormatUint(p, 10))}, true
 }
 
-func (c *refusalCache) add(route routeKey, network, address string, ttl time.Duration, now time.Time) {
+// add records a refusal of class for the pair. While the pair is excluded a
+// refusal (from a CONNECT that began before the entry existed) changes
+// nothing, except that a policy refusal replaces a transient entry. After
+// the exclusion ends, a refusal of the same class doubles the previous TTL up
+// to the class's cap; otherwise the class's base applies.
+func (c *refusalCache) add(route routeKey, network, address string, class refusalClass, now time.Time) {
 	key, ok := refusalKey(route, network, address)
-	if !ok || c.limit <= 0 || ttl <= 0 {
+	if !ok || c.limit <= 0 {
 		return
 	}
+	base, limit := classTTL(class)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.entries[key]; !ok && len(c.entries) >= c.limit {
-		var oldestKey endpointKey
-		var oldest time.Time
-		for k, expires := range c.entries {
-			if !now.Before(expires) {
-				delete(c.entries, k)
-				continue
-			}
-			if oldest.IsZero() || expires.Before(oldest) {
-				oldestKey, oldest = k, expires
-			}
+	ttl := base
+	if previous, ok := c.entries[key]; ok && !previous.forgotten(now) {
+		switch {
+		case now.Before(previous.expires) && (previous.class == class || class == classTransient):
+			return
+		case now.Before(previous.expires):
+			// A policy refusal while a transient entry is live starts the
+			// policy class at its base.
+		case previous.class == class:
+			ttl = min(2*previous.ttl, limit)
 		}
-		if len(c.entries) >= c.limit {
-			delete(c.entries, oldestKey)
+	} else if !ok && len(c.entries) >= c.limit {
+		c.evictLocked(now)
+	}
+	c.entries[key] = refusalEntry{expires: now.Add(ttl), ttl: ttl, class: class}
+}
+
+// evictLocked drops forgotten entries, then the one forgotten soonest.
+func (c *refusalCache) evictLocked(now time.Time) {
+	var oldestKey endpointKey
+	var oldest time.Time
+	for k, entry := range c.entries {
+		forget := entry.expires.Add(entry.ttl)
+		if !now.Before(forget) {
+			delete(c.entries, k)
+			continue
+		}
+		if oldest.IsZero() || forget.Before(oldest) {
+			oldestKey, oldest = k, forget
 		}
 	}
-	c.entries[key] = now.Add(ttl)
+	if len(c.entries) >= c.limit {
+		delete(c.entries, oldestKey)
+	}
 }
 
 func (c *refusalCache) contains(route routeKey, network, address string, now time.Time) bool {
@@ -292,15 +359,25 @@ func (c *refusalCache) contains(route routeKey, network, address string, now tim
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	expires, ok := c.entries[key]
+	entry, ok := c.entries[key]
 	if !ok {
 		return false
 	}
-	if !now.Before(expires) {
+	if entry.forgotten(now) {
 		delete(c.entries, key)
 		return false
 	}
-	return true
+	return now.Before(entry.expires)
+}
+
+func (c *refusalCache) remove(route routeKey, network, address string) {
+	key, ok := refusalKey(route, network, address)
+	if !ok {
+		return
+	}
+	c.mu.Lock()
+	delete(c.entries, key)
+	c.mu.Unlock()
 }
 
 // incarnation identifies one loaded managed route. The marker is preserved by
@@ -327,6 +404,7 @@ func managedIncarnation(node *chain.Node) (incarnation, bool) {
 // dialed address within the same request.
 type suspect struct {
 	route  incarnation
+	info   routeInfo
 	host   string
 	dialed string
 	at     time.Time
@@ -359,15 +437,15 @@ func NoteSuspect(ctx context.Context, node *chain.Node, network, address, dialed
 		return
 	}
 	a.mu.Lock()
-	a.suspects = append(a.suspects, suspect{route: route, host: host, dialed: network + "/" + dialed, at: time.Now()})
+	a.suspects = append(a.suspects, suspect{route: route, info: nodeRouteInfo(node), host: host, dialed: network + "/" + dialed, at: time.Now()})
 	a.mu.Unlock()
 }
 
 // BlameSuspects is called after winner connected network/dialed for the
 // request in ctx. Earlier suspects that failed the same dialed address on
 // another route are charged; a route charged with escalationHosts distinct
-// hosts within escalationWindow is quarantined. Destinations that no route
-// reaches are never charged.
+// hosts within escalationWindow is ejected, subject to the ejection cap.
+// Destinations that no route reaches are never charged.
 func BlameSuspects(ctx context.Context, winner *chain.Node, network, dialed string) {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
 	if a == nil || winner == nil {
@@ -388,32 +466,11 @@ func BlameSuspects(ctx context.Context, winner *chain.Node, network, dialed stri
 			continue
 		}
 		if defaultEscalations.charge(s.route, s.host, s.at, now) {
-			defaultQuarantine.add(s.route, now)
+			defaultEjections.eject(s.route, s.info, hopOf(ctx, s.route), ReasonDestinationFailures)
+		} else {
+			defaultEjections.noteBad(s.route)
 		}
 	}
-}
-
-// WithoutQuarantined returns nodes minus quarantined managed routes, or nil if
-// none is quarantined. Callers select from the result first and fall back to
-// the full set, so quarantine never removes the last usable route.
-func WithoutQuarantined(nodes []*chain.Node) []*chain.Node {
-	if !Enabled {
-		return nil
-	}
-	now := time.Now()
-	kept := make([]*chain.Node, 0, len(nodes))
-	excluded := false
-	for _, node := range nodes {
-		if route, ok := managedIncarnation(node); ok && defaultQuarantine.contains(route, now) {
-			excluded = true
-			continue
-		}
-		kept = append(kept, node)
-	}
-	if !excluded {
-		return nil
-	}
-	return kept
 }
 
 func destinationHost(address string) string {
@@ -502,55 +559,4 @@ func (t *escalationTracker) evict(now time.Time) {
 	if len(t.routes) >= t.limit {
 		delete(t.routes, oldestKey)
 	}
-}
-
-type quarantine struct {
-	mu      sync.Mutex
-	entries map[incarnation]time.Time
-	limit   int
-}
-
-var defaultQuarantine = newQuarantine(refusalCacheLimit)
-
-func newQuarantine(limit int) *quarantine {
-	return &quarantine{entries: map[incarnation]time.Time{}, limit: limit}
-}
-
-func (q *quarantine) add(route incarnation, now time.Time) {
-	if q.limit <= 0 {
-		return
-	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if _, ok := q.entries[route]; !ok && len(q.entries) >= q.limit {
-		var oldestKey incarnation
-		var oldest time.Time
-		for k, until := range q.entries {
-			if !now.Before(until) {
-				delete(q.entries, k)
-				continue
-			}
-			if oldest.IsZero() || until.Before(oldest) {
-				oldestKey, oldest = k, until
-			}
-		}
-		if len(q.entries) >= q.limit {
-			delete(q.entries, oldestKey)
-		}
-	}
-	q.entries[route] = now.Add(quarantineTTL)
-}
-
-func (q *quarantine) contains(route incarnation, now time.Time) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	until, ok := q.entries[route]
-	if !ok {
-		return false
-	}
-	if !now.Before(until) {
-		delete(q.entries, route)
-		return false
-	}
-	return true
 }

@@ -145,8 +145,10 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		return nil
 	}
 
+	all := p.Nodes()
+	pineroute.NoteHop(ctx, all)
 	var nodes []*chain.Node
-	for _, node := range p.Nodes() {
+	for _, node := range all {
 		if node == nil {
 			continue
 		}
@@ -181,15 +183,20 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 
 		nodes = append(nodes, node)
 	}
-	if preferred := pineroute.WithoutQuarantined(nodes); len(preferred) > 0 {
+	if preferred := pineroute.WithoutEjected(nodes); len(preferred) > 0 {
 		if node := p.selectPreferred(ctx, preferred); node != nil {
 			return node
 		}
 	}
-	return p.selectNode(ctx, nodes)
+	if node := p.selectNode(ctx, nodes); node != nil {
+		return node
+	}
+	// Every candidate is ejected or cooling down: try one anyway rather than
+	// fail the request with no route.
+	return pineroute.PanicSelect(nodes)
 }
 
-// selectPreferred selects among non-quarantined nodes with the hop's selector.
+// selectPreferred selects among non-ejected nodes with the hop's selector.
 // Selection and the selector's filters pass a single candidate through
 // unchecked, so a lone node is offered together with a copy, which shares its
 // marker and metadata, and is judged by the same cooldown rules as any other.
