@@ -402,3 +402,28 @@ func TestChargesAfterALongHealthyPeriodDoNotKeepOldK(t *testing.T) {
 		t.Fatalf("k=%d after three healthy hours, want 1", got.K)
 	}
 }
+
+// A restore timer that runs late must not lose the route_restored of an
+// ejection that a new ejection replaces first.
+func TestLateRestoreTimerStillReportsTheRestore(t *testing.T) {
+	store, clock := newTestEjectionStore(t, 16)
+	hop := testHop(4)
+	store.eject(hop[0], routeInfo{}, hop, ReasonTimeout)
+	// The TTL passes but the timer has not run yet.
+	clock.now = clock.now.Add(defaultEjectionBase + time.Second)
+	if !store.eject(hop[0], routeInfo{}, hop, ReasonTimeout) {
+		t.Fatal("an expired ejection blocked the next one")
+	}
+	kinds := []string{}
+	for _, event := range clock.events {
+		kinds = append(kinds, event.Kind)
+	}
+	if fmt.Sprint(kinds) != fmt.Sprint([]string{RouteEjected, RouteRestored, RouteEjected}) {
+		t.Fatalf("events %v, want ejected, restored, ejected", kinds)
+	}
+	clock.now = clock.now.Add(time.Hour)
+	clock.fire()
+	if n := len(clock.events); n != 4 || clock.events[3].Kind != RouteRestored {
+		t.Fatalf("after all timers: %d events, last %+v", n, clock.events[n-1])
+	}
+}

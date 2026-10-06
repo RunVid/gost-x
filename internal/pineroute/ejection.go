@@ -254,6 +254,11 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 		s.mu.Unlock()
 		return false
 	}
+	if !record.until.IsZero() && !record.until.After(now) {
+		// The ejection ended but its restore timer has not run yet: restore
+		// it now so every ejection has its route_restored, in order.
+		s.restoreLocked(route, record, record.until)
+	}
 	if !Escalation && record.until.After(now) {
 		// #8: fresh evidence renews the fixed quarantine.
 		record.until, record.lastBad = now.Add(s.base), now
@@ -282,11 +287,12 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 	s.generation++
 	record.until, record.ttl, record.reason, record.lastBad = now.Add(ttl), ttl, reason, now
 	record.generation, record.info = s.generation, info
-	event := s.eventLocked(RouteEjected, route, record)
 	generation := record.generation
+	// Events are emitted under the lock (the sink never blocks), so an
+	// ejection and its restoration always arrive in order.
+	s.emit(s.eventLocked(RouteEjected, route, record))
 	s.mu.Unlock()
 
-	s.emit(event)
 	s.after(ttl, func() { s.restore(route, generation) })
 	return true
 }
@@ -314,14 +320,17 @@ func (s *ejectionStore) restore(route incarnation, generation uint64) {
 		s.mu.Unlock()
 		return
 	}
-	now := s.now()
-	if now.After(record.lastBad) {
-		record.lastBad = now
+	s.restoreLocked(route, record, s.now())
+	s.mu.Unlock()
+}
+
+// restoreLocked ends record's ejection at restoredAt and reports it.
+func (s *ejectionStore) restoreLocked(route incarnation, record *ejectionRecord, restoredAt time.Time) {
+	if restoredAt.After(record.lastBad) {
+		record.lastBad = restoredAt
 	}
 	record.until = time.Time{}
-	event := s.eventLocked(RouteRestored, route, record)
-	s.mu.Unlock()
-	s.emit(event)
+	s.emit(s.eventLocked(RouteRestored, route, record))
 }
 
 func (s *ejectionStore) eventLocked(kind string, route incarnation, record *ejectionRecord) RouteEvent {
@@ -403,7 +412,9 @@ func routeFailureReason(err error) string {
 	return ReasonConnectError
 }
 
-// Ejected reports whether node is a managed route that is currently ejected.
+// Ejected reports whether node is a managed route that is currently ejected:
+// by an escalating ejection, or with Escalation off by #8's fixed quarantine.
+// Either way selection avoids it.
 func Ejected(node *chain.Node) bool {
 	route, ok := managedIncarnation(node)
 	return Enabled && ok && defaultEjections.ejected(route, time.Now())

@@ -108,3 +108,15 @@ func TestWithoutEscalationNoRouteWideEjectionPanicOrMerge(t *testing.T) {
 		}
 	}
 }
+
+func TestEjectedReportsTheFixedQuarantineWithoutEscalation(t *testing.T) {
+	withoutEscalation(t)
+	defer SetTimingForTest(defaultEjectionBase, time.Second)()
+	nodes := []*chain.Node{pineNode("er_legacy_q_a"), pineNode("er_legacy_q_b")}
+	route, _ := managedIncarnation(nodes[0])
+	hop := []incarnation{route}
+	defaultEjections.eject(route, routeInfo{}, hop, ReasonDestinationFailures)
+	if !Ejected(nodes[0]) || Ejected(nodes[1]) {
+		t.Fatal("Ejected must report #8's quarantine when escalation is off")
+	}
+}
