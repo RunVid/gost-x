@@ -169,6 +169,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		if path := routePath(route); len(path) > 0 {
 			node := path[len(path)-1]
 			pineroute.MarkTried(ctx, node)
+			pineroute.RecordAttempt(ctx, node, network, ipAddr, err)
 			pineroute.RecordRefusal(ctx, node, network, address, err)
 			if err == nil {
 				pineroute.BlameSuspects(ctx, node, network, ipAddr)
@@ -230,6 +231,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		Outcome:         outcome,
 		ErrorClass:      errorClass,
 		SOCKS5Reply:     socks5Reply,
+		FailureCause:    pineroute.FailureCause(ctx, err),
 		DurationMS:      time.Since(startedAt).Milliseconds(),
 	})
 

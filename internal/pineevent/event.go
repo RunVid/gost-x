@@ -24,23 +24,26 @@ const (
 // session coordinator. It deliberately carries opaque route identifiers and
 // never carries proxy addresses or credentials.
 type Event struct {
-	Version               int    `json:"v"`
-	Kind                  string `json:"kind"`
-	ObservedAtUnixMS      int64  `json:"observed_at_unix_ms"`
-	ConnectionID          string `json:"connection_id,omitempty"`
-	Network               string `json:"network,omitempty"`
-	DestinationHost       string `json:"destination_host,omitempty"`
-	DestinationPort       int    `json:"destination_port,omitempty"`
-	RouteID               string `json:"route_id,omitempty"`
-	SourceListID          string `json:"source_list_id,omitempty"`
-	Tier                  string `json:"tier,omitempty"`
-	RouteKind             string `json:"route_kind,omitempty"`
-	Attempt               int    `json:"attempt,omitempty"`
-	Attempts              int    `json:"attempts,omitempty"`
-	Result                string `json:"result,omitempty"`
-	Outcome               string `json:"outcome,omitempty"`
-	ErrorClass            string `json:"error_class,omitempty"`
-	SOCKS5Reply           string `json:"socks5_reply,omitempty"`
+	Version          int    `json:"v"`
+	Kind             string `json:"kind"`
+	ObservedAtUnixMS int64  `json:"observed_at_unix_ms"`
+	ConnectionID     string `json:"connection_id,omitempty"`
+	Network          string `json:"network,omitempty"`
+	DestinationHost  string `json:"destination_host,omitempty"`
+	DestinationPort  int    `json:"destination_port,omitempty"`
+	RouteID          string `json:"route_id,omitempty"`
+	SourceListID     string `json:"source_list_id,omitempty"`
+	Tier             string `json:"tier,omitempty"`
+	RouteKind        string `json:"route_kind,omitempty"`
+	Attempt          int    `json:"attempt,omitempty"`
+	Attempts         int    `json:"attempts,omitempty"`
+	Result           string `json:"result,omitempty"`
+	Outcome          string `json:"outcome,omitempty"`
+	ErrorClass       string `json:"error_class,omitempty"`
+	SOCKS5Reply      string `json:"socks5_reply,omitempty"`
+	// FailureCause is set on request events that had a failed attempt or no
+	// route; see pineroute.FailureCause for the values.
+	FailureCause          string `json:"failure_cause,omitempty"`
 	DurationMS            int64  `json:"duration_ms,omitempty"`
 	FirstDownstreamByteMS int64  `json:"first_downstream_byte_ms,omitempty"`
 	BytesUp               int64  `json:"bytes_up,omitempty"`
@@ -161,12 +164,25 @@ type emitter struct {
 	path    string
 	queue   chan Event
 	dropped atomic.Uint64
+	// capture, when set by a test, receives every event synchronously.
+	capture func(Event)
 }
 
-var defaultEmitter = newEmitter(os.Getenv(socketEnvironment))
+var defaultEmitter atomic.Pointer[emitter]
+
+func init() {
+	defaultEmitter.Store(newEmitter(os.Getenv(socketEnvironment)))
+}
 
 func Emit(event Event) {
-	defaultEmitter.emit(event)
+	defaultEmitter.Load().emit(event)
+}
+
+// CaptureForTest sends every emitted event to capture until the returned
+// restore function runs. Only tests in this module use it.
+func CaptureForTest(capture func(Event)) (restore func()) {
+	previous := defaultEmitter.Swap(&emitter{capture: capture})
+	return func() { defaultEmitter.Store(previous) }
 }
 
 func newEmitter(path string) *emitter {
@@ -180,6 +196,10 @@ func newEmitter(path string) *emitter {
 }
 
 func (e *emitter) emit(event Event) {
+	if e != nil && e.capture != nil {
+		e.capture(event)
+		return
+	}
 	if e == nil || e.queue == nil {
 		return
 	}
