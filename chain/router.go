@@ -173,9 +173,27 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			pineroute.RecordAttempt(ctx, node, network, ipAddr, err)
 			pineroute.RecordRefusal(ctx, node, network, address, err)
 			pineroute.RecordRouteFailure(ctx, node, network, err)
+			pineroute.AffinityAttempt(ctx, node, network, err)
 			if err == nil {
 				pineroute.RecordSuccess(ctx, node, network, address)
 				pineroute.BlameSuspects(ctx, node, network, ipAddr)
+				if move := pineroute.AffinitySuccess(ctx, node); move != nil {
+					pineevent.Emit(pineevent.Event{
+						Kind:            "affinity_moved",
+						ConnectionID:    xctx.SidFromContext(ctx).String(),
+						Network:         network,
+						DestinationHost: destinationHost,
+						DestinationPort: destinationPort,
+						RouteID:         selectedRoute.RouteID,
+						SourceListID:    selectedRoute.SourceListID,
+						Tier:            selectedRoute.Tier,
+						RouteKind:       selectedRoute.Kind,
+						Site:            move.Site,
+						FromRouteID:     move.FromRoute,
+						Reason:          move.Reason,
+						LoginSite:       move.LoginSite,
+					})
+				}
 			} else {
 				pineroute.NoteSuspect(ctx, node, network, address, ipAddr, err)
 			}

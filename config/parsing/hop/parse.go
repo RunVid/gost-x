@@ -16,6 +16,7 @@ import (
 	xhop "github.com/go-gost/x/hop"
 	hop_plugin "github.com/go-gost/x/hop/plugin"
 	"github.com/go-gost/x/internal/loader"
+	"github.com/go-gost/x/internal/pineroute"
 	"github.com/go-gost/x/internal/plugin"
 	"github.com/go-gost/x/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
@@ -183,5 +184,34 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 			loader.TimeoutHTTPLoaderOption(cfg.HTTP.Timeout),
 		)))
 	}
+	if cfg.Metadata != nil {
+		// Pine per-site affinity: the coordinator renders the switch,
+		// Chrome's timezone and the login-site list with the routes, so a
+		// reload changes them together.
+		md := metadata.NewMetadata(cfg.Metadata)
+		if mdutil.GetBool(md, "pine_site_affinity") && !affinityCompatible(cfg) {
+			log.Warnf("hop %s: pine_site_affinity needs the fifo selector and no node matchers; affinity is off", cfg.Name)
+		} else if mdutil.GetBool(md, "pine_site_affinity") {
+			if affinity := pineroute.NewAffinity(mdutil.GetString(md, "pine_plan_tz"),
+				mdutil.GetStrings(md, "pine_login_sites")); affinity != nil {
+				opts = append(opts, xhop.AffinityOption(affinity))
+			}
+		}
+	}
 	return xhop.NewHop(opts...), nil
+}
+
+// affinityCompatible reports whether a hop can run Pine site affinity, which
+// relies on fifo order: another strategy (round robin is the default) would
+// reorder routes, and a node matcher's priority would override the pin.
+func affinityCompatible(cfg *config.HopConfig) bool {
+	if cfg.Selector == nil || cfg.Selector.Strategy != "fifo" && cfg.Selector.Strategy != "ha" {
+		return false
+	}
+	for _, node := range cfg.Nodes {
+		if node != nil && node.Matcher != nil {
+			return false
+		}
+	}
+	return true
 }

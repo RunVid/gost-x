@@ -51,7 +51,8 @@ type Event struct {
 	UploadActiveMS        int64  `json:"upload_active_ms,omitempty"`
 	DownloadActiveMS      int64  `json:"download_active_ms,omitempty"`
 	DroppedEvents         uint64 `json:"dropped_events,omitempty"`
-	// Reason, K and TTLMS describe route_ejected and route_restored events.
+	// Reason, K and TTLMS describe route_ejected and route_restored events;
+	// Reason also gives why an affinity_moved event moved its site.
 	Reason string `json:"reason,omitempty"`
 	K      int    `json:"k,omitempty"`
 	TTLMS  int64  `json:"ttl_ms,omitempty"`
@@ -59,6 +60,11 @@ type Event struct {
 	// merge window: the number of no-route failures for the destination the
 	// window did not report one by one, this one included.
 	SuppressedCount int `json:"suppressed_count,omitempty"`
+	// Site, FromRouteID, Reason and LoginSite describe an affinity_moved
+	// event: the site's pin moved from FromRouteID to RouteID.
+	Site        string `json:"site,omitempty"`
+	FromRouteID string `json:"from_route_id,omitempty"`
+	LoginSite   bool   `json:"login_site,omitempty"`
 }
 
 type Route struct {
