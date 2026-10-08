@@ -198,8 +198,7 @@ func TestAffinityPinsAfterFailoverWithoutFlipBack(t *testing.T) {
 // cooldown ends; a fresh site still starts on the first route.
 func TestAffinityPinsAfterRouteCooldownWithoutFlipBack(t *testing.T) {
 	withAffinity(t)
-	pineroute.Escalation = false
-	t.Cleanup(func() { pineroute.Escalation = true })
+	t.Cleanup(pineroute.SetEscalationForTest(false))
 	ta, tb := &refusingTransport{}, &refusingTransport{}
 	aNode := route(uniqueID("a"), chromeTZ, ta)
 	r := affinityRouter(t, aNode, route(uniqueID("b"), chromeTZ, tb))

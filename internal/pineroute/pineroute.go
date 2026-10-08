@@ -247,7 +247,7 @@ func RecordRefusal(ctx context.Context, node *chain.Node, network, address strin
 
 // RecordSuccess forgets the refusal history of a pair the route just reached.
 func RecordSuccess(ctx context.Context, node *chain.Node, network, address string) {
-	if !Enabled || !Escalation || !Tracking(ctx) {
+	if !Enabled || !Escalation() || !Tracking(ctx) {
 		return
 	}
 	if id := nodeRouteKey(node); id != (routeKey{}) {
@@ -317,7 +317,7 @@ func (c *refusalCache) add(route routeKey, network, address string, class refusa
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ttl := base
-	if !Escalation {
+	if !Escalation() {
 		// #7: every refusal sets the class's fixed TTL.
 		if _, ok := c.entries[key]; !ok && len(c.entries) >= c.limit {
 			c.evictLocked(now)
@@ -351,7 +351,7 @@ func (c *refusalCache) evictLocked(now time.Time) {
 	var oldest time.Time
 	for k, entry := range c.entries {
 		forget := entry.expires.Add(entry.ttl)
-		if !Escalation {
+		if !Escalation() {
 			forget = entry.expires
 		}
 		if !now.Before(forget) {
@@ -378,7 +378,7 @@ func (c *refusalCache) contains(route routeKey, network, address string, now tim
 	if !ok {
 		return false
 	}
-	if entry.forgotten(now) || !Escalation && !now.Before(entry.expires) {
+	if entry.forgotten(now) || !Escalation() && !now.Before(entry.expires) {
 		delete(c.entries, key)
 		return false
 	}
