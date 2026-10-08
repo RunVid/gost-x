@@ -36,14 +36,14 @@ const (
 	refusalTTL        = 10 * time.Minute
 	refusalTTLCap     = 6 * time.Hour
 	transientTTL      = 30 * time.Second
-	transientTTLCap   = 10 * time.Minute
+	transientTTLCap   = 2 * time.Minute
 	refusalCacheLimit = 4096
 	escalationWindow  = 30 * time.Second
 	escalationHosts   = 3
 )
 
 // refusalClass separates vendor policy refusals from transient destination
-// failures; each doubles from its own base.
+// failures.
 type refusalClass uint8
 
 const (
@@ -171,13 +171,12 @@ type attempts struct {
 	suspects []suspect
 	records  []attemptRecord
 	// hops maps each managed route seen by this request's hop selection to
-	// the hop's managed routes, for the ejection cap.
-	hops map[incarnation][]incarnation
-	// allRefused: see NoteAllRefused.
+	// the routes of its tier, for the ejection cap.
+	hops       map[incarnation][]incarnation
 	allRefused bool
-	// hedgeWon: see MarkHedgeWon.
-	hedgeWon bool
-	request  context.Context
+	hedgeWon   bool
+	panicked   bool
+	request    context.Context
 }
 
 // WithAttempts returns a context that tracks the routes tried by one router
@@ -231,8 +230,6 @@ func Skip(ctx context.Context, node *chain.Node, network, address string) bool {
 
 // RecordRefusal remembers a destination failure. Cancellation is not cached.
 // Transient failures recover quickly; repeated cache hits never renew a TTL.
-// A refusal of a pair whose entry expired but is still remembered doubles
-// the TTL.
 func RecordRefusal(ctx context.Context, node *chain.Node, network, address string, err error) {
 	if !IgnoreFailure(ctx, node, network, err) || RequestCanceled(ctx, err) {
 		return
@@ -307,13 +304,9 @@ func refusalKey(route routeKey, network, address string) (endpointKey, bool) {
 	return endpointKey{route: route, network: network, address: net.JoinHostPort(host, strconv.FormatUint(p, 10))}, true
 }
 
-// add records a refusal of class for the pair. While the pair is excluded, a
-// refusal (from a CONNECT that began before the entry existed) does not
-// escalate: the same class keeps the later expiry at the current TTL, a
-// policy refusal replaces a transient entry at the policy base, and a
-// transient refusal never shortens a policy entry. After the exclusion ends,
-// a refusal of the same class doubles the previous TTL up to the class's
-// cap; otherwise the class's base applies.
+// add records a refusal of class for the pair. A refusal while the pair is
+// still excluded does not escalate; one after the exclusion ended doubles
+// the TTL of the same class up to its cap.
 func (c *refusalCache) add(route routeKey, network, address string, class refusalClass, now time.Time) {
 	key, ok := refusalKey(route, network, address)
 	if !ok || c.limit <= 0 {
@@ -342,8 +335,6 @@ func (c *refusalCache) add(route routeKey, network, address string, class refusa
 		case now.Before(previous.expires) && class == classTransient:
 			return
 		case now.Before(previous.expires):
-			// A policy refusal while a transient entry is live starts the
-			// policy class at its base.
 		case previous.class == class:
 			ttl = min(2*previous.ttl, limit)
 		}
@@ -354,7 +345,6 @@ func (c *refusalCache) add(route routeKey, network, address string, class refusa
 }
 
 // evictLocked drops forgotten entries, then the one forgotten soonest.
-// Without Escalation nothing is remembered past its expiry (#7).
 func (c *refusalCache) evictLocked(now time.Time) {
 	var oldestKey endpointKey
 	var oldest time.Time
@@ -427,9 +417,8 @@ func managedIncarnation(node *chain.Node) (incarnation, bool) {
 // transient reply. It is charged only if another route then reaches the same
 // dialed address within the same request.
 type suspect struct {
-	route incarnation
-	info  routeInfo
-	// slow marks a route that had not answered when a hedge connected.
+	route  incarnation
+	info   routeInfo
 	slow   bool
 	host   string
 	dialed string
@@ -469,9 +458,8 @@ func NoteSuspect(ctx context.Context, node *chain.Node, network, address, dialed
 
 // BlameSuspects is called after winner connected network/dialed for the
 // request in ctx. Earlier suspects that failed the same dialed address on
-// another route are charged; a route charged with escalationHosts distinct
-// hosts within escalationWindow is ejected, subject to the ejection cap.
-// Destinations that no route reaches are never charged.
+// another route are charged; enough distinct hosts within escalationWindow
+// eject the route, subject to the ejection cap.
 func BlameSuspects(ctx context.Context, winner *chain.Node, network, dialed string) {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
 	if a == nil || winner == nil {
@@ -491,13 +479,13 @@ func BlameSuspects(ctx context.Context, winner *chain.Node, network, dialed stri
 		if s.dialed != target || s.route == winnerRoute {
 			continue
 		}
-		if defaultEscalations.charge(s.route, s.host, s.at, now) {
-			reason := ReasonDestinationFailures
-			if s.slow {
-				reason = ReasonSlow
-			}
+		tracker, reason := defaultEscalations, ReasonDestinationFailures
+		if s.slow {
+			tracker, reason = defaultSlowEscalations, ReasonSlow
+		}
+		if tracker.charge(s.route, s.host, s.at, now) {
 			defaultEjections.eject(s.route, s.info, hopOf(ctx, s.route), reason)
-		} else {
+		} else if !s.slow {
 			defaultEjections.noteBad(s.route)
 		}
 	}
@@ -518,6 +506,7 @@ type escalationTracker struct {
 	mu     sync.Mutex
 	routes map[incarnation][]hostSeen
 	limit  int
+	hosts  int
 }
 
 type hostSeen struct {
@@ -525,16 +514,19 @@ type hostSeen struct {
 	at   time.Time
 }
 
-var defaultEscalations = newEscalationTracker(refusalCacheLimit)
+var (
+	defaultEscalations     = newEscalationTracker(refusalCacheLimit, escalationHosts)
+	defaultSlowEscalations = newEscalationTracker(refusalCacheLimit, slowHosts)
+)
 
-func newEscalationTracker(limit int) *escalationTracker {
-	return &escalationTracker{routes: map[incarnation][]hostSeen{}, limit: limit}
+func newEscalationTracker(limit, hosts int) *escalationTracker {
+	return &escalationTracker{routes: map[incarnation][]hostSeen{}, limit: limit, hosts: hosts}
 }
 
 // charge records that route failed host at failedAt and reports whether the
-// route has failed escalationHosts distinct hosts within escalationWindow of
-// now. Recency is measured from the failure, not from when it was charged, so
-// a delayed attribution cannot refresh old evidence. The route's history is
+// route has failed t.hosts distinct hosts within escalationWindow of now.
+// Recency is measured from the failure, not from when it was charged, so a
+// delayed attribution cannot refresh old evidence. The route's history is
 // cleared when it escalates.
 func (t *escalationTracker) charge(route incarnation, host string, failedAt, now time.Time) bool {
 	if route.id == "" || host == "" || t.limit <= 0 || now.Sub(failedAt) >= escalationWindow {
@@ -560,7 +552,7 @@ func (t *escalationTracker) charge(route incarnation, host string, failedAt, now
 		recent = append(recent, h)
 	}
 	recent = append(recent, hostSeen{host: host, at: failedAt})
-	if len(recent) >= escalationHosts {
+	if len(recent) >= t.hosts {
 		delete(t.routes, route)
 		return true
 	}

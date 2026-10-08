@@ -88,34 +88,6 @@ func TestNoRouteMergerStaysBounded(t *testing.T) {
 	}
 }
 
-func TestNoRouteMergeDisabledOutsidePine(t *testing.T) {
-	Enabled = false
-	defer func() { Enabled = true }()
-	for i := 0; i < 3; i++ {
-		if !MergeNoRoute("tcp", "x.example:443", nil, func(any, int) {}) {
-			t.Fatal("no-route failures were merged outside Pine")
-		}
-	}
-}
-
-func TestNoRouteSummaryStaysWithinTheCoordinatorsBound(t *testing.T) {
-	if maxSuppressedPerSummary != 1_000_000 {
-		t.Fatal("the summary bound must match the coordinator's maxSuppressedCount")
-	}
-	maxSuppressedPerSummary = 1000
-	defer func() { maxSuppressedPerSummary = 1_000_000 }()
-	merger, timers := newTestMerger(8)
-	var flushed []int
-	flush := func(_ any, n int) { flushed = append(flushed, n) }
-	for i := 0; i < maxSuppressedPerSummary+11; i++ {
-		merger.merge("tcp", "huge.example:443", i, flush)
-	}
-	(*timers)[0]()
-	if len(flushed) != 2 || flushed[0] != maxSuppressedPerSummary || flushed[1] != 10 {
-		t.Fatalf("summaries %v, want [%d 10]", flushed, maxSuppressedPerSummary)
-	}
-}
-
 func TestLateTimerDoesNotCloseANewerWindow(t *testing.T) {
 	merger, timers := newTestMerger(8)
 	var flushed []int

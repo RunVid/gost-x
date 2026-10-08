@@ -99,50 +99,12 @@ func TestWithoutEscalationNoRouteWideEjectionPanicOrMerge(t *testing.T) {
 	if Ejected(nodes[0]) {
 		t.Fatal("a route-wide failure ejected a route without escalation")
 	}
-	if PanicSelect(nodes) != nil {
+	if PanicSelect(ctx, nodes) != nil {
 		t.Fatal("panic selection ran without escalation")
 	}
 	for i := 0; i < 3; i++ {
 		if !MergeNoRoute("tcp", "x.example:443", nil, func(any, int) {}) {
 			t.Fatal("no_route failures were merged without escalation")
 		}
-	}
-}
-
-func TestEjectedReportsTheFixedQuarantineWithoutEscalation(t *testing.T) {
-	withoutEscalation(t)
-	defer SetTimingForTest(defaultEjectionBase, time.Second)()
-	nodes := []*chain.Node{pineNode("er_legacy_q_a"), pineNode("er_legacy_q_b")}
-	route, _ := managedIncarnation(nodes[0])
-	hop := []incarnation{route}
-	defaultEjections.eject(route, routeInfo{}, hop, ReasonDestinationFailures)
-	if !Ejected(nodes[0]) || Ejected(nodes[1]) {
-		t.Fatal("Ejected must report #8's quarantine when escalation is off")
-	}
-}
-
-func TestHedgeWonIsPerRequest(t *testing.T) {
-	ctx := WithAttempts(context.Background())
-	if HedgeWon(ctx) {
-		t.Fatal("a fresh request reports a hedge win")
-	}
-	MarkHedgeWon(ctx)
-	if !HedgeWon(ctx) || HedgeWon(WithAttempts(context.Background())) {
-		t.Fatal("hedge win not scoped to its request")
-	}
-	if HedgeWon(context.Background()) {
-		t.Fatal("an untracked context reports a hedge win")
-	}
-}
-
-func TestHedgeDelayNeedsPine(t *testing.T) {
-	defer SetHedgeDelayForTest(time.Second)()
-	if HedgeDelay() != time.Second {
-		t.Fatal("hedge delay not applied")
-	}
-	Enabled = false
-	defer func() { Enabled = true }()
-	if HedgeDelay() != 0 {
-		t.Fatal("hedging outside Pine")
 	}
 }

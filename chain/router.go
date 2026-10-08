@@ -102,18 +102,18 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 	ctx = pineroute.WithAttempts(ctx)
 	hedgeDelay := pineroute.HedgeDelay()
 
-	// Attempt goroutines only dial. Everything else (route state, evidence,
-	// events) happens here, one completed attempt at a time.
+	// Attempt goroutines only dial; route state, evidence and events are
+	// handled here, one completed attempt at a time.
 	results := make(chan *dialAttempt, 2)
 	var inflight []*dialAttempt
 	finish := func(a *dialAttempt) {
-		attempts := inflight[:0]
+		kept := inflight[:0]
 		for _, other := range inflight {
 			if other != a {
-				attempts = append(attempts, other)
+				kept = append(kept, other)
 			}
 		}
-		inflight = attempts
+		inflight = kept
 	}
 	for {
 		if len(inflight) == 0 {
@@ -124,7 +124,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 				err = ctx.Err()
 				break
 			}
-			a, launchErr := r.launch(ctx, network, address, attempts+1, false, results, log)
+			a, launchErr := r.launch(ctx, network, address, attempts+1, nil, results, log)
 			if a == nil {
 				if launchErr == pineroute.ErrNoRoute && lastAttemptErr != nil {
 					launchErr = lastAttemptErr
@@ -150,13 +150,8 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			finish(a)
 			selectedRoute = a.selected
 			if a.err == nil {
-				// The other attempt, if any, lost: cancel it and close a
-				// connection it may still produce. SOCKS connectors bound
-				// their exchange by their own timeout (Pine renders 5 s), so
-				// a loser that ignores cancellation still ends. A first route
-				// still pending when the hedge won is evidence that it is
-				// slow; the connector's health marker still sees the loser's
-				// real outcome if it arrives.
+				// The other attempt lost: cancel it and close a connection it
+				// may still produce (the connector's own timeout bounds it).
 				for _, loser := range inflight {
 					if a.hedge && !loser.hedge {
 						pineroute.NoteSlowSuspect(ctx, loser.node, network, address, loser.ipAddr)
@@ -178,7 +173,6 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 				}
 				conn, err = a.conn, nil
 				if buf := ictx.BufferFromContext(ctx); buf != nil && a.hedge {
-					// The caller's record describes the route that served.
 					buf.Reset()
 					buf.WriteString(a.path)
 				}
@@ -198,7 +192,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		case <-hedgeFire:
 			hedged = true
 			raceFirst = inflight[0].index
-			h, _ := r.launch(ctx, network, address, attempts+1, true, results, log)
+			h, _ := r.launch(ctx, network, address, attempts+1, inflight[0], results, log)
 			if h != nil {
 				attempts++
 				inflight = append(inflight, h)
@@ -235,21 +229,21 @@ func discard(results <-chan *dialAttempt) {
 }
 
 // launch selects the next route and starts dialing it. It returns nil and
-// the error that ends the request when no attempt can start. A hedge never
-// uses the explicit direct node: direct is for exhaustion. Pine configures no
-// resolver (the provider resolves), so preparing a hedge does not block on
-// DNS while the first attempt may already have answered.
-func (r *Router) launch(ctx context.Context, network, address string, index int, hedge bool,
+// the error that ends the request when no attempt can start. With first set
+// it starts a hedge for that attempt, or returns nil, nil when the selected
+// route is no hedge candidate.
+func (r *Router) launch(ctx context.Context, network, address string, index int, first *dialAttempt,
 	results chan<- *dialAttempt, log logger.Logger) (*dialAttempt, error) {
-	attemptCtx, cancel := ctx, context.CancelFunc(func() {})
+	hedge := first != nil
+	var attemptCtx context.Context
+	var cancel context.CancelFunc
 	if r.options.Timeout > 0 {
 		attemptCtx, cancel = context.WithTimeout(ctx, r.options.Timeout)
 	} else {
 		attemptCtx, cancel = context.WithCancel(ctx)
 	}
 	if hedge && ictx.BufferFromContext(ctx) != nil {
-		// A hedge runs next to the first attempt: give it its own recorder
-		// buffer so nested dials of the two never share one.
+		// Nested dials of the two racing attempts never share a recorder buffer.
 		attemptCtx = ictx.ContextWithBuffer(attemptCtx, &bytes.Buffer{})
 	}
 
@@ -285,7 +279,6 @@ func (r *Router) launch(ctx context.Context, network, address string, index int,
 	// excluded, so fail instead of falling through to GOST's implicit
 	// direct route.
 	if pineroute.Enabled && r.options.Chain != nil && (route == nil || len(route.Nodes()) == 0) {
-		// The attempt's own deadline (selection used it) wins, as before.
 		stopped := attemptCtx.Err()
 		cancel()
 		if stopped != nil {
@@ -300,11 +293,11 @@ func (r *Router) launch(ctx context.Context, network, address string, index int,
 	if path := routePath(route); len(path) > 0 {
 		node = path[len(path)-1]
 	}
-	if hedge && pineroute.IsDirect(node) {
+	if hedge && !pineroute.HedgeCandidate(first.node, node) {
 		cancel()
 		return nil, nil
 	}
-	// Mark at launch so a hedge cannot select the route still dialing.
+	// Marked at launch so a hedge cannot select the route still dialing.
 	pineroute.MarkTried(ctx, node)
 	a := &dialAttempt{index: index, hedge: hedge, route: route, node: node, selected: pineRoute(route),
 		ipAddr: ipAddr, path: buf.String(), startedAt: time.Now(), cancel: cancel}
@@ -397,9 +390,6 @@ func (r *Router) finishDial(ctx context.Context, conn net.Conn, err error, start
 		Hedge:           hedgeResult,
 	}
 	if attempts == 0 && errors.Is(err, pineroute.ErrNoRoute) && pineroute.AllRefused(ctx) {
-		// Every route was excluded for this destination before any attempt.
-		// Report the first such failure in a window; the window's summary
-		// carries the rest as suppressed_count.
 		event.ObservedAtUnixMS = time.Now().UnixMilli()
 		if !pineroute.MergeNoRoute(network, address, event, emitNoRouteSummary) {
 			return conn, err
@@ -409,9 +399,8 @@ func (r *Router) finishDial(ctx context.Context, conn net.Conn, err error, start
 	return conn, err
 }
 
-// emitNoRouteSummary reports the no-route failures a window suppressed as
-// one request event when the window closes: the latest one's identity, with
-// the count.
+// emitNoRouteSummary reports the no-route failures a window suppressed as one
+// request event with the count.
 func emitNoRouteSummary(last any, suppressed int) {
 	event, ok := last.(pineevent.Event)
 	if !ok {

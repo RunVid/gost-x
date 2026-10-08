@@ -9,23 +9,15 @@ import (
 )
 
 // When every route of a destination is excluded by its per-destination
-// refusals, each browser retry fails at once with no route. Those failures
-// are real but say nothing new, and a retrying page produces hundreds a
-// minute. The first one in a window is reported as usual; the rest are
-// counted and reported once, as one event with the count, when the window
-// closes. The browser still sees every failure immediately.
+// refusals, each browser retry fails at once with no route. The first such
+// failure in a window is reported as usual; the rest are counted and reported
+// once, with the count, when the window closes.
 const (
 	noRouteMergeWindow = 10 * time.Second
 	noRouteMergeLimit  = 1024
 )
 
-// maxSuppressedPerSummary keeps a summary inside the coordinator's accepted
-// range (1,000,000); a window that reaches it reports a summary at once and
-// keeps counting. A variable only so tests can use a small bound.
-var maxSuppressedPerSummary = 1_000_000
-
 type noRouteWindow struct {
-	// last is the payload of the latest suppressed failure.
 	last       any
 	suppressed int
 	flush      func(last any, suppressed int)
@@ -51,9 +43,7 @@ func newNoRouteMerger(limit int, window time.Duration) *noRouteMerger {
 }
 
 // NoteAllRefused records that hop selection for the request in ctx found no
-// candidate because the per-destination refusals excluded every node. Only
-// such failures are merged; other exclusions (bypass, matchers, an empty
-// plan) are reported one by one.
+// candidate because the per-destination refusals excluded every node.
 func NoteAllRefused(ctx context.Context) {
 	if a, _ := ctx.Value(attemptsKey{}).(*attempts); a != nil {
 		a.mu.Lock()
@@ -80,14 +70,10 @@ func Refused(ctx context.Context, node *chain.Node, network, address string) boo
 	return Enabled && id != (routeKey{}) && Tracking(ctx) && defaultRefusals.contains(id, network, address, time.Now())
 }
 
-// MergeNoRoute is called for a request that failed with no route before any
-// attempt because every route refused the destination (AllRefused). It
-// reports whether the caller should report the failure now: true for the
-// first failure for network/address in a window (or when merging is not
-// possible), false when the failure was counted into the open window.
-// payload describes this failure. When a window that suppressed failures
-// closes, flush runs once with the latest suppressed payload and the number
-// of suppressed failures.
+// MergeNoRoute reports whether a no-route failure for network/address should
+// be reported now: true for the first in a window, false when it was counted
+// into the open window. When such a window closes, flush runs once with the
+// latest suppressed payload and the count.
 func MergeNoRoute(network, address string, payload any, flush func(last any, suppressed int)) bool {
 	if !Enabled || !Escalation {
 		return true
@@ -102,20 +88,12 @@ func (m *noRouteMerger) merge(network, address string, payload any, flush func(a
 	}
 	id := key.network + "/" + key.address
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if window := m.windows[id]; window != nil {
 		window.last = payload
 		window.suppressed++
-		if window.suppressed < maxSuppressedPerSummary {
-			m.mu.Unlock()
-			return false
-		}
-		last, suppressed := window.last, window.suppressed
-		window.suppressed = 0
-		m.mu.Unlock()
-		window.flush(last, suppressed)
 		return false
 	}
-	defer m.mu.Unlock()
 	if len(m.windows) >= m.limit {
 		return true
 	}
@@ -125,8 +103,7 @@ func (m *noRouteMerger) merge(network, address string, payload any, flush func(a
 	return true
 }
 
-// close ends window. A late timer never closes a newer window for the same
-// destination.
+// close ends window unless a newer window replaced it.
 func (m *noRouteMerger) close(id string, window *noRouteWindow) {
 	m.mu.Lock()
 	if m.windows[id] != window {

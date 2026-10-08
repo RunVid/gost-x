@@ -9,14 +9,17 @@ import (
 )
 
 // Hedged CONNECT: when the first route has not answered within the hedge
-// delay, the router dials the next route in parallel and keeps whichever
-// connects first. The coordinator sets PINE_GOST_HEDGE_DELAY from the
-// deployment's chart value; unset or zero turns hedging off.
+// delay, the router dials the next route of the same source list in parallel
+// and keeps whichever connects first. Unset or zero turns hedging off.
 const hedgeDelayEnvironment = "PINE_GOST_HEDGE_DELAY"
 
-// ReasonSlow ejects a route that kept losing hedges: other routes connected
-// the same addresses while it had not answered.
-const ReasonSlow = "slow"
+// ReasonSlow ejects a route that lost hedges for slowHosts distinct hosts
+// within escalationWindow. A lost hedge is weaker evidence than a refusal
+// another route got past, so the bar is higher than escalationHosts.
+const (
+	ReasonSlow = "slow"
+	slowHosts  = 6
+)
 
 var hedgeDelay = hedgeDelayFromEnvironment()
 
@@ -38,16 +41,25 @@ func HedgeDelay() time.Duration {
 }
 
 // SetHedgeDelayForTest sets the hedge delay until the returned function runs.
-// Only tests in this module use it.
 func SetHedgeDelayForTest(delay time.Duration) (restore func()) {
 	previous := hedgeDelay
 	hedgeDelay = delay
 	return func() { hedgeDelay = previous }
 }
 
+// HedgeCandidate reports whether node may hedge for first: a managed route of
+// the same source list, so a hedge win does not move a site to another exit
+// pool mid-session.
+func HedgeCandidate(first, node *chain.Node) bool {
+	if first == nil || node == nil || IsDirect(node) {
+		return false
+	}
+	return nodeRouteInfo(first).sourceListID == nodeRouteInfo(node).sourceListID
+}
+
 // NoteSlowSuspect records that node had not answered dialed for address when
-// a hedge route connected it. Like a failed attempt, it is charged only if
-// the winner reached the same dialed address (BlameSuspects).
+// a hedge route connected it. It is charged only if the winner reached the
+// same dialed address (BlameSuspects).
 func NoteSlowSuspect(ctx context.Context, node *chain.Node, network, address, dialed string) {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
 	route, ok := managedIncarnation(node)
@@ -72,8 +84,7 @@ func MarkHedgeWon(ctx context.Context) {
 }
 
 // HedgeWon reports whether the request in ctx was served by a hedge route
-// while its first route had not failed. A site's pinned route (#636) must not
-// move for such a win: the first route only answered slowly.
+// while its first route had not failed, so site affinity keeps its pin.
 func HedgeWon(ctx context.Context) bool {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
 	if a == nil {

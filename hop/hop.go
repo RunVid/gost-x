@@ -148,17 +148,13 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	all := p.Nodes()
 	pineroute.NoteHop(ctx, all)
 	var nodes []*chain.Node
-	// eligible counts nodes this destination may use at all; refused counts
-	// those of them its per-destination refusals exclude. Nodes left out by
-	// bypass, matcher or filter (an ISP route kept for login sites) are not
-	// candidates, so they do not stop a no-route storm from being merged.
+	// eligible counts nodes this destination may use at all (bypass, matcher
+	// and filter applied); refused counts those its refusals exclude.
 	eligible, refused := 0, 0
 	for _, node := range all {
 		if node == nil {
 			continue
 		}
-		// Without escalation nothing is merged: keep the cheap exclusion first,
-		// so bypass plugins are not asked about routes already excluded.
 		if !pineroute.Escalation && pineroute.Skip(ctx, node, options.Network, options.Host) {
 			continue
 		}
@@ -208,9 +204,7 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	if node := p.selectNode(ctx, nodes); node != nil {
 		return node
 	}
-	// Every candidate is ejected or cooling down: try one anyway rather than
-	// fail the request with no route.
-	return pineroute.PanicSelect(nodes)
+	return pineroute.PanicSelect(ctx, nodes)
 }
 
 // selectPreferred selects among non-ejected nodes with the hop's selector.

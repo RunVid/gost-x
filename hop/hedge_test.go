@@ -11,6 +11,7 @@ import (
 
 	corechain "github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
+	xchain "github.com/go-gost/x/chain"
 	"github.com/go-gost/x/internal/pineevent"
 	"github.com/go-gost/x/internal/pineroute"
 	mdx "github.com/go-gost/x/metadata"
@@ -100,10 +101,8 @@ func requestEvent(t *testing.T, events *eventLog, host string) pineevent.Event {
 	return found[len(found)-1]
 }
 
-// Production pattern (INT B): the first route answers host_unreachable after
-// ~3 s while the next connects at once. With a hedge the request is served by
-// the second route right after the hedge delay and the slow one is cancelled
-// without being recorded as a failure.
+// The first route answers host_unreachable after ~3 s while the next connects
+// at once: the hedge serves after the delay and the loser is not recorded.
 func TestHedgeServesFromTheNextRouteAfterTheDelay(t *testing.T) {
 	defer pineroute.SetHedgeDelayForTest(100 * time.Millisecond)()
 	events := captureEvents(t)
@@ -117,8 +116,6 @@ func TestHedgeServesFromTheNextRouteAfterTheDelay(t *testing.T) {
 	if err != nil || took > time.Second {
 		t.Fatalf("hedged request took %s (err %v), want about the hedge delay", took, err)
 	}
-	// The hedge starts only after the delay, never at once (half the delay:
-	// the first dial is stamped a little after the router started it).
 	if gap := time.Duration(fast.firstDial.Load() - slow.firstDial.Load()); gap < 50*time.Millisecond {
 		t.Fatalf("the hedge started %s after the first route, want about the 100 ms delay", gap)
 	}
@@ -216,27 +213,34 @@ func TestBothRacersFailingContinuesSequentially(t *testing.T) {
 	}
 }
 
-// Automatic plans keep direct for exhaustion: a hedge never dials it.
-func TestHedgeNeverUsesDirect(t *testing.T) {
+// A hedge stays in the first route's source list and never dials direct.
+func TestHedgeStaysInTheFirstRoutesList(t *testing.T) {
 	defer pineroute.SetHedgeDelayForTest(50 * time.Millisecond)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
 	slow := &slowTransport{delay: 400 * time.Millisecond}
+	slowNode := pineNode("er_list_a_"+id, slow)
+	slowNode.Options().Metadata = mdx.NewMetadata(map[string]any{"pine_route_id": "er_list_a_" + id, "pine_source_list_id": "epl_a"})
+	otherList := pineNode("er_list_b_"+id, &slowTransport{})
+	otherList.Options().Metadata = mdx.NewMetadata(map[string]any{"pine_route_id": "er_list_b_" + id, "pine_source_list_id": "epl_b"})
 	direct := corechain.NewNode("direct-"+id, "",
 		corechain.TransportNodeOption(&slowTransport{}),
 		corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct", "backup": true})))
-	r := newTestRouter(pineNode("er_nodirect_"+id, slow), direct)
-	host := "nodirect-" + id + ".example"
-	if _, err := timedDial(t, r, host+":443"); err != nil {
-		t.Fatal(err)
-	}
-	if event := requestEvent(t, events, host); event.Hedge != "" || event.Attempts != 1 || event.RouteID != "er_nodirect_"+id {
-		t.Fatalf("request event %+v", event)
+	for name, r := range map[string]*xchain.Router{
+		"other list": newTestRouter(slowNode, otherList),
+		"direct":     newTestRouter(slowNode, direct),
+	} {
+		host := "nohedge-" + name[:1] + "-" + id + ".example"
+		if _, err := timedDial(t, r, host+":443"); err != nil {
+			t.Fatal(err)
+		}
+		if event := requestEvent(t, events, host); event.Hedge != "" || event.Attempts != 1 || event.RouteID != "er_list_a_"+id {
+			t.Fatalf("%s: request event %+v", name, event)
+		}
 	}
 }
 
-// Hedges the first route keeps losing on distinct hosts are evidence: it is
-// ejected as slow.
+// Lost hedges on six distinct hosts eject the slow route; three do not.
 func TestRouteLosingHedgesIsEjectedAsSlow(t *testing.T) {
 	defer pineroute.SetHedgeDelayForTest(100 * time.Millisecond)()
 	defer pineroute.SetTimingForTest(time.Minute/2, time.Second)()
@@ -248,9 +252,12 @@ func TestRouteLosingHedgesIsEjectedAsSlow(t *testing.T) {
 		nodes = append(nodes, pineNode(fmt.Sprintf("er_slowok%d_%s", i, id), &slowTransport{}))
 	}
 	r := newTestRouter(nodes...)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 6; i++ {
 		if _, err := timedDial(t, r, fmt.Sprintf("slowhost-%d-%s.example:443", i, id)); err != nil {
 			t.Fatal(err)
+		}
+		if ejected := events.routeEvents("route_ejected", "er_slowroute_"+id); len(ejected) != 0 && i < 5 {
+			t.Fatalf("ejected after %d lost hedges: %+v", i+1, ejected)
 		}
 	}
 	ejected := events.routeEvents("route_ejected", "er_slowroute_"+id)

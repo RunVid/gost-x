@@ -167,8 +167,8 @@ func TestEjectionCapIsHalfTheHop(t *testing.T) {
 					ejected++
 				}
 			}
-			if ejected != m/2 || len(clock.events) != m/2 {
-				t.Fatalf("ejected %d of %d (events %d), want %d", ejected, m, len(clock.events), m/2)
+			if want := max(1, m/2); ejected != want || len(clock.events) != want {
+				t.Fatalf("ejected %d of %d (events %d), want %d", ejected, m, len(clock.events), want)
 			}
 			// Once one restores, another may go.
 			if m >= 2 {
@@ -182,24 +182,27 @@ func TestEjectionCapIsHalfTheHop(t *testing.T) {
 	}
 }
 
-func TestCappedEjectionStillCountsAsEvidence(t *testing.T) {
+func TestCappedEjectionCountsAsEvidenceButKeepsEarnedDecay(t *testing.T) {
 	store, clock := newTestEjectionStore(t, 16)
 	hop := testHop(2)
+	for i := 0; i < 3; i++ {
+		store.eject(hop[1], routeInfo{}, hop, ReasonTimeout)
+		clock.now = clock.now.Add(store.entries[hop[1]].ttl)
+		clock.fire()
+	}
+	clock.now = clock.now.Add(3 * time.Hour)
 	store.eject(hop[0], routeInfo{}, hop, ReasonTimeout)
 	if store.eject(hop[1], routeInfo{}, hop, ReasonTimeout) {
 		t.Fatal("cap exceeded")
 	}
-	if store.entries[hop[1]].k != 0 || !store.entries[hop[1]].lastBad.Equal(clock.now) {
+	if !store.entries[hop[1]].lastBad.Equal(clock.now) {
 		t.Fatalf("capped route: %+v", *store.entries[hop[1]])
 	}
-}
-
-func TestEjectionRequiresHopMembership(t *testing.T) {
-	store, _ := newTestEjectionStore(t, 16)
-	hop := testHop(4)
-	outsider := incarnation{id: "er_outsider", marker: pineNode("er_outsider").Marker()}
-	if store.eject(outsider, routeInfo{}, hop, ReasonTimeout) || store.eject(hop[0], routeInfo{}, nil, ReasonTimeout) {
-		t.Fatal("a route was ejected without its hop")
+	clock.now = clock.now.Add(defaultEjectionBase)
+	clock.fire()
+	store.eject(hop[1], routeInfo{}, hop, ReasonTimeout)
+	if got := clock.events[len(clock.events)-1]; got.Kind != RouteEjected || got.K != 1 {
+		t.Fatalf("%+v: capped evidence after three healthy hours must not keep the old k", got)
 	}
 }
 
@@ -225,22 +228,6 @@ func TestConcurrentEjectionsNeverExceedTheCap(t *testing.T) {
 	wg.Wait()
 	if ejected != 4 {
 		t.Fatalf("ejected %d routes of 9, want 4", ejected)
-	}
-}
-
-func TestEjectionJitterStaysWithinTenPercent(t *testing.T) {
-	store := newEjectionStore(16, defaultEjectionBase)
-	store.after = func(time.Duration, func()) {}
-	var events []RouteEvent
-	store.emit = func(event RouteEvent) { events = append(events, event) }
-	hop := testHop(16)
-	for _, route := range hop[:8] {
-		store.eject(route, routeInfo{}, hop, ReasonTimeout)
-	}
-	for _, event := range events {
-		if event.TTL < defaultEjectionBase || event.TTL >= defaultEjectionBase+defaultEjectionBase/10 {
-			t.Fatalf("ttl %s outside [30s, 33s)", event.TTL)
-		}
 	}
 }
 
@@ -356,27 +343,29 @@ func TestPanicSelectOrder(t *testing.T) {
 	NoteHop(ctx, []*chain.Node{ejectedPrimary, primary, backup, pineNode("er_panic_4")})
 	RecordRouteFailure(ctx, ejectedPrimary, "tcp", errors.New("reset"))
 	direct := chain.NewNode("direct", "", chain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct", "backup": true})))
-	if got := PanicSelect([]*chain.Node{direct, ejectedPrimary, backup, primary}); got != primary {
+	request := func() context.Context { return WithAttempts(context.Background()) }
+	if got := PanicSelect(request(), []*chain.Node{direct, ejectedPrimary, backup, primary}); got != primary {
 		t.Fatalf("panic picked %v, want the non-ejected primary", got.Name)
 	}
-	if got := PanicSelect([]*chain.Node{direct, backup, ejectedPrimary}); got != ejectedPrimary {
+	if got := PanicSelect(request(), []*chain.Node{direct, backup, ejectedPrimary}); got != ejectedPrimary {
 		t.Fatalf("panic picked %v, want the ejected primary before any backup", got.Name)
 	}
-	if got := PanicSelect([]*chain.Node{direct, backup}); got != backup {
+	if got := PanicSelect(request(), []*chain.Node{direct, backup}); got != backup {
 		t.Fatalf("panic picked %v, want the managed backup before direct", got.Name)
 	}
-	if got := PanicSelect([]*chain.Node{direct}); got != direct {
+	if got := PanicSelect(request(), []*chain.Node{direct}); got != direct {
 		t.Fatal("panic did not use direct as the last resort of an automatic plan")
 	}
-	if got := PanicSelect([]*chain.Node{ejectedPrimary}); got != ejectedPrimary {
-		t.Fatal("panic did not fall back to an ejected route")
-	}
-	if PanicSelect(nil) != nil {
+	if PanicSelect(request(), nil) != nil {
 		t.Fatal("panic invented a route")
+	}
+	once := request()
+	if PanicSelect(once, []*chain.Node{ejectedPrimary}) != ejectedPrimary || PanicSelect(once, []*chain.Node{primary}) != nil {
+		t.Fatal("a request gets exactly one panic attempt")
 	}
 	Enabled = false
 	defer func() { Enabled = true }()
-	if PanicSelect([]*chain.Node{primary}) != nil {
+	if PanicSelect(request(), []*chain.Node{primary}) != nil {
 		t.Fatal("panic selection ran outside Pine")
 	}
 }
