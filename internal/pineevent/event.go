@@ -59,10 +59,6 @@ type Event struct {
 	// merge window: the number of no-route failures for the destination the
 	// window did not report one by one, this one included.
 	SuppressedCount int `json:"suppressed_count,omitempty"`
-	// Hedge is set on request events that started a hedge route: "won" (the
-	// hedge route served), "lost" (the first route served) or "failed" (both
-	// failed).
-	Hedge string `json:"hedge,omitempty"`
 }
 
 type Route struct {

@@ -174,7 +174,6 @@ type attempts struct {
 	// the routes of its tier, for the ejection cap.
 	hops       map[incarnation][]incarnation
 	allRefused bool
-	hedgeWon   bool
 	panicked   bool
 	request    context.Context
 }
@@ -419,7 +418,6 @@ func managedIncarnation(node *chain.Node) (incarnation, bool) {
 type suspect struct {
 	route  incarnation
 	info   routeInfo
-	slow   bool
 	host   string
 	dialed string
 	at     time.Time
@@ -479,13 +477,9 @@ func BlameSuspects(ctx context.Context, winner *chain.Node, network, dialed stri
 		if s.dialed != target || s.route == winnerRoute {
 			continue
 		}
-		tracker, reason := defaultEscalations, ReasonDestinationFailures
-		if s.slow {
-			tracker, reason = defaultSlowEscalations, ReasonSlow
-		}
-		if tracker.charge(s.route, s.host, s.at, now) {
-			defaultEjections.eject(s.route, s.info, hopOf(ctx, s.route), reason)
-		} else if !s.slow {
+		if defaultEscalations.charge(s.route, s.host, s.at, now) {
+			defaultEjections.eject(s.route, s.info, hopOf(ctx, s.route), ReasonDestinationFailures)
+		} else {
 			defaultEjections.noteBad(s.route)
 		}
 	}
@@ -506,7 +500,6 @@ type escalationTracker struct {
 	mu     sync.Mutex
 	routes map[incarnation][]hostSeen
 	limit  int
-	hosts  int
 }
 
 type hostSeen struct {
@@ -514,19 +507,16 @@ type hostSeen struct {
 	at   time.Time
 }
 
-var (
-	defaultEscalations     = newEscalationTracker(refusalCacheLimit, escalationHosts)
-	defaultSlowEscalations = newEscalationTracker(refusalCacheLimit, slowHosts)
-)
+var defaultEscalations = newEscalationTracker(refusalCacheLimit)
 
-func newEscalationTracker(limit, hosts int) *escalationTracker {
-	return &escalationTracker{routes: map[incarnation][]hostSeen{}, limit: limit, hosts: hosts}
+func newEscalationTracker(limit int) *escalationTracker {
+	return &escalationTracker{routes: map[incarnation][]hostSeen{}, limit: limit}
 }
 
 // charge records that route failed host at failedAt and reports whether the
-// route has failed t.hosts distinct hosts within escalationWindow of now.
-// Recency is measured from the failure, not from when it was charged, so a
-// delayed attribution cannot refresh old evidence. The route's history is
+// route has failed escalationHosts distinct hosts within escalationWindow of
+// now. Recency is measured from the failure, not from when it was charged, so
+// a delayed attribution cannot refresh old evidence. The route's history is
 // cleared when it escalates.
 func (t *escalationTracker) charge(route incarnation, host string, failedAt, now time.Time) bool {
 	if route.id == "" || host == "" || t.limit <= 0 || now.Sub(failedAt) >= escalationWindow {
@@ -552,7 +542,7 @@ func (t *escalationTracker) charge(route incarnation, host string, failedAt, now
 		recent = append(recent, h)
 	}
 	recent = append(recent, hostSeen{host: host, at: failedAt})
-	if len(recent) >= t.hosts {
+	if len(recent) >= escalationHosts {
 		delete(t.routes, route)
 		return true
 	}

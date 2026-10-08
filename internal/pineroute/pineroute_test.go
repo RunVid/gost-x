@@ -262,7 +262,7 @@ func TestOnlyTCPConnectNetworksAreDestinationScoped(t *testing.T) {
 }
 
 func TestEscalationNeedsDistinctHostsWithinWindow(t *testing.T) {
-	tracker := newEscalationTracker(8, escalationHosts)
+	tracker := newEscalationTracker(8)
 	route := incarnation{id: "er_window", marker: pineNode("er_window").Marker()}
 	now := time.Now()
 	if tracker.charge(route, "a.example", now, now) || tracker.charge(route, "a.example", now, now) ||
@@ -285,7 +285,7 @@ func TestEscalationNeedsDistinctHostsWithinWindow(t *testing.T) {
 }
 
 func TestDelayedAttributionUsesFailureTime(t *testing.T) {
-	tracker := newEscalationTracker(8, escalationHosts)
+	tracker := newEscalationTracker(8)
 	route := incarnation{id: "er_delayed", marker: pineNode("er_delayed").Marker()}
 	now := time.Now()
 	old := now.Add(-escalationWindow - time.Second)
@@ -303,7 +303,7 @@ func TestDelayedAttributionUsesFailureTime(t *testing.T) {
 }
 
 func TestEscalationTrackerAndEjectionsStayBounded(t *testing.T) {
-	tracker := newEscalationTracker(4, escalationHosts)
+	tracker := newEscalationTracker(4)
 	store := newEjectionStore(4, time.Second)
 	store.after = func(time.Duration, func()) {}
 	store.emit = func(RouteEvent) {}
@@ -385,7 +385,7 @@ func TestOnlyManagedTransientRepliesBecomeSuspects(t *testing.T) {
 }
 
 func TestOlderDuplicateDoesNotReplaceNewerEvidence(t *testing.T) {
-	tracker := newEscalationTracker(8, escalationHosts)
+	tracker := newEscalationTracker(8)
 	route := incarnation{id: "er_dup", marker: pineNode("er_dup").Marker()}
 	base := time.Now()
 	tracker.charge(route, "a.example", base.Add(25*time.Second), base.Add(25*time.Second))
