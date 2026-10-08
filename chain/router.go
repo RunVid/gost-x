@@ -151,8 +151,12 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			selectedRoute = a.selected
 			if a.err == nil {
 				// The other attempt, if any, lost: cancel it and close a
-				// connection it may still produce. A first route still
-				// pending when the hedge won is evidence that it is slow.
+				// connection it may still produce. SOCKS connectors bound
+				// their exchange by their own timeout (Pine renders 5 s), so
+				// a loser that ignores cancellation still ends. A first route
+				// still pending when the hedge won is evidence that it is
+				// slow; the connector's health marker still sees the loser's
+				// real outcome if it arrives.
 				for _, loser := range inflight {
 					if a.hedge && !loser.hedge {
 						pineroute.NoteSlowSuspect(ctx, loser.node, network, address, loser.ipAddr)
@@ -173,6 +177,11 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 					}
 				}
 				conn, err = a.conn, nil
+				if buf := ictx.BufferFromContext(ctx); buf != nil && a.hedge {
+					// The caller's record describes the route that served.
+					buf.Reset()
+					buf.WriteString(a.path)
+				}
 				r.settle(ctx, a, network, address, destinationHost, destinationPort)
 				a.cancel()
 				return r.finishDial(ctx, conn, err, startedAt, destinationHost, destinationPort, network, address,
@@ -211,6 +220,7 @@ type dialAttempt struct {
 	node      *chain.Node
 	selected  pineevent.Route
 	ipAddr    string
+	path      string
 	startedAt time.Time
 	cancel    context.CancelFunc
 	conn      net.Conn
@@ -226,7 +236,9 @@ func discard(results <-chan *dialAttempt) {
 
 // launch selects the next route and starts dialing it. It returns nil and
 // the error that ends the request when no attempt can start. A hedge never
-// uses the explicit direct node: direct is for exhaustion.
+// uses the explicit direct node: direct is for exhaustion. Pine configures no
+// resolver (the provider resolves), so preparing a hedge does not block on
+// DNS while the first attempt may already have answered.
 func (r *Router) launch(ctx context.Context, network, address string, index int, hedge bool,
 	results chan<- *dialAttempt, log logger.Logger) (*dialAttempt, error) {
 	attemptCtx, cancel := ctx, context.CancelFunc(func() {})
@@ -288,7 +300,7 @@ func (r *Router) launch(ctx context.Context, network, address string, index int,
 	// Mark at launch so a hedge cannot select the route still dialing.
 	pineroute.MarkTried(ctx, node)
 	a := &dialAttempt{index: index, hedge: hedge, route: route, node: node, selected: pineRoute(route),
-		ipAddr: ipAddr, startedAt: time.Now(), cancel: cancel}
+		ipAddr: ipAddr, path: buf.String(), startedAt: time.Now(), cancel: cancel}
 	go func() {
 		a.conn, a.err = route.Dial(attemptCtx, network, ipAddr,
 			chain.InterfaceDialOption(r.options.IfceName),
