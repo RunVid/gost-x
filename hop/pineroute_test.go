@@ -5,14 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-gost/core/bypass"
 	corechain "github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
+	"github.com/go-gost/core/routing"
 	xchain "github.com/go-gost/x/chain"
+	"github.com/go-gost/x/internal/pineevent"
 	"github.com/go-gost/x/internal/pineroute"
 	xlogger "github.com/go-gost/x/logger"
 	mdx "github.com/go-gost/x/metadata"
@@ -21,6 +25,7 @@ import (
 
 func TestMain(m *testing.M) {
 	pineroute.Enabled = true
+	pineroute.Escalation = true
 	m.Run()
 }
 
@@ -405,14 +410,10 @@ func TestUpstreamReplyDoesNotPoisonDestinationCache(t *testing.T) {
 			if primary.Marker().Count() != 1 {
 				t.Fatal("upstream failure did not cool the proxy")
 			}
-			// Simulate the proxy recovering after its route cooldown. There
-			// must be no independent destination refusal left behind.
-			broken.dialErr, broken.handshakeErr = nil, nil
-			primary.Marker().Reset()
-			if err := dial(t, r, host+":443"); err != nil {
-				t.Fatal(err)
+			if !pineroute.Ejected(primary) {
+				t.Fatal("an upstream failure did not eject the route")
 			}
-			if broken.connects.Load() != 1 || healthy.connects.Load() != 1 {
+			if pineroute.Skip(pineroute.WithAttempts(context.Background()), primary, "tcp", host+":443") {
 				t.Fatal("upstream failure was incorrectly cached against the destination")
 			}
 		})
@@ -540,9 +541,8 @@ func TestRepeatedHostDoesNotQuarantine(t *testing.T) {
 	}
 }
 
-// Routes with complementary reachability charge each other until both are
-// quarantined. Quarantine must never leave a request without a route: with
-// every route quarantined, selection falls back to the full set.
+// Routes with complementary reachability charge each other. The cap stops the
+// second ejection, and selection falls back to the full set anyway.
 func TestComplementaryRoutesNeverBlackOut(t *testing.T) {
 	id := fmt.Sprint(time.Now().UnixNano())
 	aRefuses, bRefuses := map[string]error{}, map[string]error{}
@@ -560,8 +560,8 @@ func TestComplementaryRoutesNeverBlackOut(t *testing.T) {
 			}
 		}
 	}
-	if left := pineroute.WithoutQuarantined([]*corechain.Node{aNode, bNode}); left == nil || len(left) != 0 {
-		t.Fatalf("precondition: both routes should be quarantined, %d left", len(left))
+	if left := pineroute.WithoutEjected([]*corechain.Node{aNode, bNode}); left == nil || len(left) != 1 {
+		t.Fatalf("want exactly one of two routes ejected, %d left", len(left))
 	}
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
@@ -701,5 +701,297 @@ func TestQuarantinedOnlyRouteIsStillUsed(t *testing.T) {
 	solo := newTestRouter(onlyNode)
 	if err := dial(t, solo, "solo-"+id+".example:443"); err != nil {
 		t.Fatalf("quarantined sole route was not used: %v", err)
+	}
+}
+
+type eventLog struct {
+	mu     sync.Mutex
+	events []pineevent.Event
+}
+
+func captureEvents(t *testing.T) *eventLog {
+	t.Helper()
+	log := &eventLog{}
+	restore := pineevent.CaptureForTest(func(event pineevent.Event) {
+		log.mu.Lock()
+		log.events = append(log.events, event)
+		log.mu.Unlock()
+	})
+	t.Cleanup(restore)
+	return log
+}
+
+func (l *eventLog) kind(kind string) []pineevent.Event {
+	return l.match(func(event pineevent.Event) bool { return event.Kind == kind })
+}
+
+// Tests filter by their own route or host: timers of earlier tests can still
+// emit while a later test captures.
+func (l *eventLog) match(keep func(pineevent.Event) bool) []pineevent.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var matched []pineevent.Event
+	for _, event := range l.events {
+		if keep(event) {
+			matched = append(matched, event)
+		}
+	}
+	return matched
+}
+
+func (l *eventLog) routeEvents(kind, routeID string) []pineevent.Event {
+	return l.match(func(event pineevent.Event) bool { return event.Kind == kind && event.RouteID == routeID })
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A dead route is avoided for growing periods and comes back to the base
+// period after healthy windows (base scaled down to 200 ms).
+func TestDeadRouteIsAvoidedForGrowingPeriods(t *testing.T) {
+	base := 200 * time.Millisecond
+	defer pineroute.SetTimingForTest(base, time.Second)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	dead := &refusingTransport{dialErr: errors.New("connection refused by proxy")}
+	healthy := &refusingTransport{}
+	deadNode := pineNode("er_dead_"+id, dead)
+	deadNode.Options().Metadata = mdx.NewMetadata(map[string]any{"pine_route_id": "er_dead_" + id, "pine_tier": "primary", "pine_source_list_id": "epl_dead"})
+	r := newTestRouterWithFailFilter(1, time.Millisecond, deadNode, pineNode("er_ok_"+id, healthy))
+	for round := 1; round <= 3; round++ {
+		if err := dial(t, r, fmt.Sprintf("r%d-%s.example:443", round, id)); err != nil {
+			t.Fatal(err)
+		}
+		ejected := events.routeEvents("route_ejected", "er_dead_"+id)
+		if len(ejected) != round {
+			t.Fatalf("round %d: %d ejections", round, len(ejected))
+		}
+		got := ejected[round-1]
+		want := time.Duration(round) * base
+		if got.RouteID != "er_dead_"+id || got.K != round || got.Reason != "connect_error" || got.Tier != "primary" ||
+			got.SourceListID != "epl_dead" || got.RouteKind != "managed" ||
+			got.TTLMS < want.Milliseconds() || got.TTLMS > (want+want/10).Milliseconds() {
+			t.Fatalf("round %d: %+v, want k=%d ttl≈%s", round, got, round, want)
+		}
+		before := dead.dials.Load()
+		if err := dial(t, r, fmt.Sprintf("during-%d-%s.example:443", round, id)); err != nil || dead.dials.Load() != before {
+			t.Fatalf("round %d: ejected route was tried (err %v)", round, err)
+		}
+		waitFor(t, "restore", func() bool { return len(events.routeEvents("route_restored", "er_dead_"+id)) == round })
+	}
+	// Healthy windows (2 × base each) bring k back down.
+	time.Sleep(3 * 2 * base)
+	if err := dial(t, r, "after-healthy-"+id+".example:443"); err != nil {
+		t.Fatal(err)
+	}
+	if last := events.routeEvents("route_ejected", "er_dead_"+id); last[len(last)-1].K != 1 {
+		t.Fatalf("k=%d after healthy windows, want 1", last[len(last)-1].K)
+	}
+}
+
+// Never more than half of a hop's routes are ejected, however many are dead.
+func TestNoMoreThanHalfTheRoutesAreEjected(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Second)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	var nodes []*corechain.Node
+	for i := 0; i < 3; i++ {
+		nodes = append(nodes, pineNode(fmt.Sprintf("er_dead%d_%s", i, id), &refusingTransport{handshakeErr: errors.New("reset")}))
+	}
+	healthy := &refusingTransport{}
+	nodes = append(nodes, pineNode("er_alive_"+id, healthy))
+	r := newTestRouter(nodes...)
+	for i := 0; i < 5; i++ {
+		if err := dial(t, r, fmt.Sprintf("h%d-%s.example:443", i, id)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ejected := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "route_ejected" && strings.HasSuffix(event.RouteID, "_"+id)
+	})
+	if n := len(ejected); n != 2 {
+		t.Fatalf("%d of 4 routes ejected, want 2", n)
+	}
+	if left := pineroute.WithoutEjected(nodes); len(left) != 2 {
+		t.Fatalf("%d routes left, want 2", len(left))
+	}
+}
+
+// A destination refusing every route is that site's problem: the routes stay.
+func TestSingleSiteRefusalNeverEjects(t *testing.T) {
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	host := "one-site-" + id + ".example"
+	a := &refusingTransport{refused: map[string]error{host: socksReply(4)}}
+	b := &refusingTransport{refused: map[string]error{host: socksReply(5)}}
+	r := newTestRouter(pineNode("er_site_a_"+id, a), pineNode("er_site_b_"+id, b))
+	for i := 0; i < 50; i++ {
+		_ = dial(t, r, fmt.Sprintf("%s:%d", host, 1000+i))
+	}
+	ejected := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "route_ejected" && strings.HasSuffix(event.RouteID, "_"+id)
+	})
+	if n := len(ejected); n != 0 {
+		t.Fatalf("a single-site refusal ejected %d routes", n)
+	}
+}
+
+// When every route is cooling down, a request still tries one rather than
+// failing with no route (explicit plan: no direct node).
+func TestEveryRouteCooledStillDials(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Second)()
+	id := fmt.Sprint(time.Now().UnixNano())
+	a := &refusingTransport{handshakeErr: errors.New("reset")}
+	b := &refusingTransport{handshakeErr: errors.New("reset")}
+	r := newTestRouter(pineNode("er_cool_a_"+id, a), pineNode("er_cool_b_"+id, b))
+	if err := dial(t, r, "first-"+id+".example:443"); err == nil {
+		t.Fatal("precondition: both routes should fail")
+	}
+	a.handshakeErr, b.handshakeErr = nil, nil
+	if err := dial(t, r, "second-"+id+".example:443"); err != nil {
+		t.Fatalf("every route cooled produced %v instead of a panic attempt", err)
+	}
+}
+
+// A 1,000-request no_route burst for one destination produces a handful of
+// request events; the browser still sees every failure.
+func TestNoRouteBurstCollapses(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, 1500*time.Millisecond)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	host := "storm-" + id + ".example"
+	r := newTestRouter(
+		pineNode("er_storm_a_"+id, &refusingTransport{refused: map[string]error{host: socksReply(2)}}),
+		pineNode("er_storm_b_"+id, &refusingTransport{refused: map[string]error{host: socksReply(2)}}))
+	if err := dial(t, r, host+":443"); err == nil {
+		t.Fatal("precondition: every route refuses")
+	}
+	var wg sync.WaitGroup
+	var failures atomic.Int32
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := dial(t, r, host+":443"); errors.Is(err, pineroute.ErrNoRoute) {
+				failures.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if failures.Load() != 1000 {
+		t.Fatalf("browser saw %d no_route failures, want 1000", failures.Load())
+	}
+	stormRequests := func() []pineevent.Event {
+		return events.match(func(event pineevent.Event) bool { return event.Kind == "request" && event.DestinationHost == host })
+	}
+	waitFor(t, "every window's summary", func() bool {
+		total := 0
+		for _, event := range stormRequests() {
+			if event.ErrorClass == "no_route" {
+				if event.SuppressedCount == 0 {
+					total++
+				}
+				total += event.SuppressedCount
+			}
+		}
+		return total >= 1000
+	})
+	var noRoute, leaders, suppressed int
+	for _, event := range stormRequests() {
+		if event.ErrorClass == "no_route" {
+			noRoute++
+			if event.SuppressedCount == 0 {
+				leaders++
+			}
+			suppressed += event.SuppressedCount
+			if event.Attempts != 0 || event.FailureCause != "unknown" {
+				t.Fatalf("unexpected no_route event %+v", event)
+			}
+		}
+	}
+	if leaders+suppressed != 1000 || noRoute > 4 {
+		t.Fatalf("no_route events=%d leaders=%d suppressed=%d for 1000 failures", noRoute, leaders, suppressed)
+	}
+}
+
+// Only requests whose routes were all excluded by per-destination refusals
+// are merged: a matcher or bypass that leaves no route is reported each time.
+func TestNoRouteFromOtherExclusionsIsNotMerged(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Minute)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	only := pineNode("er_matcher_"+id, &refusingTransport{})
+	only.Options().Matcher = neverMatches{}
+	r := newTestRouter(only)
+	for i := 0; i < 5; i++ {
+		if err := dial(t, r, "filtered-"+id+".example:443"); !errors.Is(err, pineroute.ErrNoRoute) {
+			t.Fatalf("want no_route, got %v", err)
+		}
+	}
+	filtered := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "request" && event.DestinationHost == "filtered-"+id+".example"
+	})
+	if n := len(filtered); n != 5 {
+		t.Fatalf("%d request events for 5 matcher exclusions, want 5", n)
+	}
+}
+
+type neverMatches struct{}
+
+func (neverMatches) Match(*routing.Request) bool { return false }
+
+// bypassAll excludes every destination, like an ISP node kept for login sites
+// when the destination is not one.
+type bypassAll struct{}
+
+func (bypassAll) Contains(context.Context, string, string, ...bypass.Option) bool { return true }
+func (bypassAll) IsWhitelist() bool                                               { return false }
+
+// A hop with ISP nodes that node bypass excludes for the destination still
+// merges the storm when every candidate refused it.
+func TestNoRouteStormMergesWithBypassedNodesInTheHop(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Minute)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	host := "private-" + id + ".example"
+	isp := pineNode("er_isp_"+id, &refusingTransport{})
+	isp.Options().Bypass = bypassAll{}
+	r := newTestRouter(
+		pineNode("er_bp_a_"+id, &refusingTransport{refused: map[string]error{host: socksReply(2)}}),
+		pineNode("er_bp_b_"+id, &refusingTransport{refused: map[string]error{host: socksReply(4)}}),
+		isp)
+	if err := dial(t, r, host+":80"); err == nil {
+		t.Fatal("precondition: every managed route refuses")
+	}
+	for i := 0; i < 20; i++ {
+		if err := dial(t, r, host+":80"); !errors.Is(err, pineroute.ErrNoRoute) {
+			t.Fatalf("want no_route, got %v", err)
+		}
+	}
+	noRoute := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "request" && event.DestinationHost == host && event.ErrorClass == "no_route"
+	})
+	if len(noRoute) != 1 {
+		t.Fatalf("%d no_route events reported at once for 20 failures, want 1 leader", len(noRoute))
+	}
+	// Every node bypassed is a configuration gap, reported one by one.
+	gap := pineNode("er_gap_"+id, &refusingTransport{})
+	gap.Options().Bypass = bypassAll{}
+	only := newTestRouter(gap)
+	for i := 0; i < 3; i++ {
+		_ = dial(t, only, "gap-"+id+".example:80")
+	}
+	if n := len(events.match(func(event pineevent.Event) bool {
+		return event.Kind == "request" && event.DestinationHost == "gap-"+id+".example"
+	})); n != 3 {
+		t.Fatalf("%d events for 3 all-bypassed requests, want 3", n)
 	}
 }

@@ -3,6 +3,7 @@ package chain
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -171,7 +172,9 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			pineroute.MarkTried(ctx, node)
 			pineroute.RecordAttempt(ctx, node, network, ipAddr, err)
 			pineroute.RecordRefusal(ctx, node, network, address, err)
+			pineroute.RecordRouteFailure(ctx, node, network, err)
 			if err == nil {
+				pineroute.RecordSuccess(ctx, node, network, address)
 				pineroute.BlameSuspects(ctx, node, network, ipAddr)
 			} else {
 				pineroute.NoteSuspect(ctx, node, network, address, ipAddr, err)
@@ -217,7 +220,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		pineevent.SetSelectedRoute(ctx, selectedRoute, outcome)
 	}
 	errorClass, socks5Reply := pineevent.ErrorDetails(err)
-	pineevent.Emit(pineevent.Event{
+	event := pineevent.Event{
 		Kind:            "request",
 		ConnectionID:    xctx.SidFromContext(ctx).String(),
 		Network:         network,
@@ -233,9 +236,27 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		SOCKS5Reply:     socks5Reply,
 		FailureCause:    pineroute.FailureCause(ctx, err),
 		DurationMS:      time.Since(startedAt).Milliseconds(),
-	})
-
+	}
+	if attempts == 0 && errors.Is(err, pineroute.ErrNoRoute) && pineroute.AllRefused(ctx) {
+		event.ObservedAtUnixMS = time.Now().UnixMilli()
+		if !pineroute.MergeNoRoute(network, address, event, emitNoRouteSummary) {
+			return
+		}
+	}
+	pineevent.Emit(event)
 	return
+}
+
+// emitNoRouteSummary reports the no-route failures a window suppressed as one
+// request event with the count.
+func emitNoRouteSummary(last any, suppressed int) {
+	event, ok := last.(pineevent.Event)
+	if !ok {
+		return
+	}
+	event.SuppressedCount = suppressed
+	event.ObservedAtUnixMS = time.Now().UnixMilli()
+	pineevent.Emit(event)
 }
 
 func pineRoute(route chain.Route) pineevent.Route {

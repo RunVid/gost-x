@@ -16,6 +16,7 @@ import (
 
 func TestMain(m *testing.M) {
 	Enabled = true
+	Escalation = true
 	m.Run()
 }
 
@@ -72,7 +73,7 @@ func TestSkipTracksTriedNodesPerRequest(t *testing.T) {
 func TestRefusalCacheScopesByNodeAndHost(t *testing.T) {
 	cache := newRefusalCache(8)
 	now := time.Unix(1_700_000_000, 0)
-	cache.add(routeKey{managedID: "route-a"}, "tcp", "Accounts.Google.com.:443", time.Minute, now)
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "Accounts.Google.com.:443", classTransient, now)
 
 	if !cache.contains(routeKey{managedID: "route-a"}, "tcp", "accounts.google.com:443", now) {
 		t.Fatal("refused host was not remembered")
@@ -83,7 +84,7 @@ func TestRefusalCacheScopesByNodeAndHost(t *testing.T) {
 	if cache.contains(routeKey{managedID: "route-b"}, "tcp", "accounts.google.com:443", now) {
 		t.Fatal("refusal spread to another route")
 	}
-	if cache.contains(routeKey{managedID: "route-a"}, "tcp", "accounts.google.com:443", now.Add(time.Minute)) {
+	if cache.contains(routeKey{managedID: "route-a"}, "tcp", "accounts.google.com:443", now.Add(transientTTL)) {
 		t.Fatal("refusal outlived its TTL")
 	}
 }
@@ -92,16 +93,16 @@ func TestRefusalCacheStaysBounded(t *testing.T) {
 	cache := newRefusalCache(4)
 	now := time.Unix(1_700_000_000, 0)
 	for i := 0; i < 10; i++ {
-		cache.add(routeKey{managedID: "route-a"}, "tcp", fmt.Sprintf("host-%d.example:443", i), time.Hour, now)
+		cache.add(routeKey{managedID: "route-a"}, "tcp", fmt.Sprintf("host-%d.example:443", i), classPolicy, now)
 	}
 	if len(cache.entries) > 4 {
 		t.Fatalf("cache holds %d entries, want at most 4", len(cache.entries))
 	}
 
 	cache = newRefusalCache(2)
-	cache.add(routeKey{managedID: "route-a"}, "tcp", "old.example:443", time.Hour, now)
-	cache.add(routeKey{managedID: "route-a"}, "tcp", "kept.example:443", time.Hour, now.Add(time.Minute))
-	cache.add(routeKey{managedID: "route-a"}, "tcp", "new.example:443", time.Hour, now.Add(2*time.Minute))
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "old.example:443", classPolicy, now)
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "kept.example:443", classPolicy, now.Add(time.Minute))
+	cache.add(routeKey{managedID: "route-a"}, "tcp", "new.example:443", classPolicy, now.Add(2*time.Minute))
 	if cache.contains(routeKey{managedID: "route-a"}, "tcp", "old.example:443", now.Add(2*time.Minute)) {
 		t.Fatal("a full cache kept its oldest refusal")
 	}
@@ -144,7 +145,7 @@ func TestDestinationReplyClassification(t *testing.T) {
 func TestRefusalCacheSeparatesPortsNetworksAndIPFamilies(t *testing.T) {
 	cache := newRefusalCache(8)
 	now := time.Now()
-	cache.add(routeKey{managedID: "route"}, "tcp", "Example.COM.:0443", time.Minute, now)
+	cache.add(routeKey{managedID: "route"}, "tcp", "Example.COM.:0443", classTransient, now)
 	if !cache.contains(routeKey{managedID: "route"}, "tcp", "example.com:443", now) {
 		t.Fatal("equivalent hostname/port did not match")
 	}
@@ -155,12 +156,12 @@ func TestRefusalCacheSeparatesPortsNetworksAndIPFamilies(t *testing.T) {
 			t.Fatalf("refusal crossed endpoint boundary: %+v", endpoint)
 		}
 	}
-	cache.add(routeKey{managedID: "route"}, "tcp", "[2001:0db8::1]:443", time.Minute, now)
+	cache.add(routeKey{managedID: "route"}, "tcp", "[2001:0db8::1]:443", classTransient, now)
 	if !cache.contains(routeKey{managedID: "route"}, "tcp", "[2001:db8::1]:443", now) {
 		t.Fatal("equivalent IPv6 address did not match")
 	}
 	for _, address := range []string{"", "example.com", ":443", "example.com:0", "example.com:65536"} {
-		cache.add(routeKey{managedID: "invalid"}, "tcp", address, time.Minute, now)
+		cache.add(routeKey{managedID: "invalid"}, "tcp", address, classTransient, now)
 		if cache.contains(routeKey{managedID: "invalid"}, "tcp", address, now) {
 			t.Fatalf("invalid endpoint cached: %q", address)
 		}
@@ -170,7 +171,7 @@ func TestRefusalCacheSeparatesPortsNetworksAndIPFamilies(t *testing.T) {
 func TestTransientRefusalExpiresWithoutSlidingOnReads(t *testing.T) {
 	cache := newRefusalCache(8)
 	now := time.Now()
-	cache.add(routeKey{managedID: "route"}, "tcp", "gone.example:443", transientTTL, now)
+	cache.add(routeKey{managedID: "route"}, "tcp", "gone.example:443", classTransient, now)
 	if !cache.contains(routeKey{managedID: "route"}, "tcp", "gone.example:443", now.Add(transientTTL-time.Nanosecond)) {
 		t.Fatal("transient refusal expired too early")
 	}
@@ -218,7 +219,7 @@ func TestRefusalCacheConcurrentChurn(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 100; i++ {
 				address := fmt.Sprintf("host-%d-%d.example:443", worker, i)
-				cache.add(routeKey{managedID: "route"}, "tcp", address, transientTTL, time.Now())
+				cache.add(routeKey{managedID: "route"}, "tcp", address, classTransient, time.Now())
 				cache.contains(routeKey{managedID: "route"}, "tcp", address, time.Now())
 			}
 		}(worker)
@@ -301,9 +302,11 @@ func TestDelayedAttributionUsesFailureTime(t *testing.T) {
 	}
 }
 
-func TestEscalationTrackerAndQuarantineStayBounded(t *testing.T) {
+func TestEscalationTrackerAndEjectionsStayBounded(t *testing.T) {
 	tracker := newEscalationTracker(4)
-	q := newQuarantine(4)
+	store := newEjectionStore(4, time.Second)
+	store.after = func(time.Duration, func()) {}
+	store.emit = func(RouteEvent) {}
 	var wg sync.WaitGroup
 	for worker := 0; worker < 8; worker++ {
 		wg.Add(1)
@@ -311,34 +314,17 @@ func TestEscalationTrackerAndQuarantineStayBounded(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
 				route := incarnation{id: fmt.Sprintf("er_%d_%d", worker, i), marker: pineNode("m").Marker()}
+				other := incarnation{id: "er_other", marker: route.marker}
 				tracker.charge(route, "h.example", time.Now(), time.Now())
-				q.add(route, time.Now())
-				q.contains(route, time.Now())
+				store.eject(route, routeInfo{}, []incarnation{route, other}, ReasonDestinationFailures)
+				store.noteBad(route)
+				store.ejected(route, time.Now())
 			}
 		}(worker)
 	}
 	wg.Wait()
-	if len(tracker.routes) > 4 || len(q.entries) > 4 {
-		t.Fatalf("bounds exceeded: tracker=%d quarantine=%d", len(tracker.routes), len(q.entries))
-	}
-}
-
-func TestQuarantineExpiresAndFollowsIncarnation(t *testing.T) {
-	q := newQuarantine(8)
-	loaded := pineNode("er_reload")
-	route, _ := managedIncarnation(loaded)
-	copied, _ := managedIncarnation(loaded.Copy())
-	reloaded, _ := managedIncarnation(pineNode("er_reload"))
-	now := time.Now()
-	q.add(route, now)
-	if !q.contains(copied, now) {
-		t.Fatal("node copy lost its quarantine")
-	}
-	if q.contains(reloaded, now) {
-		t.Fatal("a reloaded route inherited its predecessor's quarantine")
-	}
-	if q.contains(route, now.Add(quarantineTTL)) {
-		t.Fatal("quarantine did not expire")
+	if len(tracker.routes) > 4 || len(store.entries) > 4 {
+		t.Fatalf("bounds exceeded: tracker=%d ejections=%d", len(tracker.routes), len(store.entries))
 	}
 }
 
@@ -352,7 +338,7 @@ func TestSuspectsRequireSameDialedAddressAndLiveRequest(t *testing.T) {
 		NoteSuspect(ctx, failed, "tcp", address, "192.0.2.1:443", replyError(4))
 		BlameSuspects(ctx, winner, "tcp", "198.51.100.1:443")
 	}
-	if WithoutQuarantined([]*chain.Node{failed, winner}) != nil {
+	if WithoutEjected([]*chain.Node{failed, winner}) != nil {
 		t.Fatal("a route was charged for a different resolved address")
 	}
 	canceled, cancel := context.WithCancel(context.Background())
@@ -362,7 +348,7 @@ func TestSuspectsRequireSameDialedAddressAndLiveRequest(t *testing.T) {
 	}
 	cancel()
 	BlameSuspects(tracked, winner, "tcp", "c:443")
-	if WithoutQuarantined([]*chain.Node{failed, winner}) != nil {
+	if WithoutEjected([]*chain.Node{failed, winner}) != nil {
 		t.Fatal("a canceled request charged its suspects")
 	}
 	BlameSuspects(ctx, nil, "tcp", "x:443")
@@ -407,5 +393,98 @@ func TestOlderDuplicateDoesNotReplaceNewerEvidence(t *testing.T) {
 	tracker.charge(route, "b.example", base.Add(31*time.Second), base.Add(31*time.Second))
 	if !tracker.charge(route, "c.example", base.Add(32*time.Second), base.Add(32*time.Second)) {
 		t.Fatal("a late duplicate erased newer evidence for the same host")
+	}
+}
+
+func TestRepeatRefusalDoublesTTLUpToTheCap(t *testing.T) {
+	for _, tc := range []struct {
+		class     refusalClass
+		base, cap time.Duration
+	}{
+		{classPolicy, refusalTTL, refusalTTLCap},
+		{classTransient, transientTTL, transientTTLCap},
+	} {
+		cache := newRefusalCache(8)
+		route := routeKey{managedID: "route"}
+		now := time.Unix(1_700_000_000, 0)
+		want := tc.base
+		for i := 0; i < 12; i++ {
+			cache.add(route, "tcp", "blocked.example:443", tc.class, now)
+			entry := cache.entries[endpointKey{route: route, network: "tcp", address: "blocked.example:443"}]
+			if entry.ttl != want {
+				t.Fatalf("class %d refusal %d: ttl %s, want %s", tc.class, i+1, entry.ttl, want)
+			}
+			if !cache.contains(route, "tcp", "blocked.example:443", now.Add(want-time.Nanosecond)) ||
+				cache.contains(route, "tcp", "blocked.example:443", now.Add(want)) {
+				t.Fatalf("class %d refusal %d: exclusion does not last %s", tc.class, i+1, want)
+			}
+			// The route is tried again as soon as the exclusion ends.
+			now = now.Add(want)
+			want = min(2*want, tc.cap)
+		}
+	}
+}
+
+func TestRefusalWhileExcludedDoesNotEscalate(t *testing.T) {
+	cache := newRefusalCache(8)
+	route := routeKey{managedID: "route"}
+	key := endpointKey{route: route, network: "tcp", address: "x.example:443"}
+	now := time.Unix(1_700_000_000, 0)
+	cache.add(route, "tcp", "x.example:443", classTransient, now)
+	cache.add(route, "tcp", "x.example:443", classTransient, now.Add(time.Second))
+	if entry := cache.entries[key]; entry.ttl != transientTTL || !entry.expires.Equal(now.Add(time.Second+transientTTL)) {
+		t.Fatalf("a concurrent duplicate should keep the later expiry without doubling: %+v", entry)
+	}
+	// A policy refusal replaces a live transient entry at the policy base.
+	cache.add(route, "tcp", "x.example:443", classPolicy, now.Add(2*time.Second))
+	if entry := cache.entries[key]; entry.class != classPolicy || entry.ttl != refusalTTL {
+		t.Fatalf("policy refusal over a transient entry: %+v", entry)
+	}
+	// A transient refusal never shortens a live policy entry.
+	cache.add(route, "tcp", "x.example:443", classTransient, now.Add(3*time.Second))
+	if entry := cache.entries[key]; entry.class != classPolicy {
+		t.Fatalf("transient refusal replaced a policy entry: %+v", entry)
+	}
+}
+
+func TestRefusalHistoryResetsOnClassChangeForgetAndSuccess(t *testing.T) {
+	route := routeKey{managedID: "route"}
+	key := endpointKey{route: route, network: "tcp", address: "x.example:443"}
+	now := time.Unix(1_700_000_000, 0)
+
+	cache := newRefusalCache(8)
+	cache.add(route, "tcp", "x.example:443", classTransient, now)
+	cache.add(route, "tcp", "x.example:443", classPolicy, now.Add(transientTTL))
+	if entry := cache.entries[key]; entry.ttl != refusalTTL {
+		t.Fatalf("class change kept the old history: %+v", entry)
+	}
+
+	cache = newRefusalCache(8)
+	cache.add(route, "tcp", "x.example:443", classTransient, now)
+	// Forgotten one TTL after the exclusion ended.
+	cache.add(route, "tcp", "x.example:443", classTransient, now.Add(2*transientTTL))
+	if entry := cache.entries[key]; entry.ttl != transientTTL {
+		t.Fatalf("a forgotten refusal still doubled: %+v", entry)
+	}
+
+	cache = newRefusalCache(8)
+	cache.add(route, "tcp", "x.example:443", classTransient, now)
+	cache.remove(route, "tcp", "X.example.:443")
+	cache.add(route, "tcp", "x.example:443", classTransient, now.Add(transientTTL))
+	if entry := cache.entries[key]; entry.ttl != transientTTL {
+		t.Fatalf("a success did not reset the history: %+v", entry)
+	}
+}
+
+func TestRecordSuccessForgetsThePair(t *testing.T) {
+	node := pineNode("er_success_reset")
+	ctx := WithAttempts(context.Background())
+	RecordRefusal(ctx, node, "tcp", "reset.example:443", replyError(2))
+	if !Skip(WithAttempts(context.Background()), node, "tcp", "reset.example:443") {
+		t.Fatal("precondition: refusal not cached")
+	}
+	RecordSuccess(ctx, node, "tcp", "reset.example:443")
+	if Skip(WithAttempts(context.Background()), node, "tcp", "reset.example:443") {
+		t.Fatal("a success did not clear the refusal")
 	}
 }

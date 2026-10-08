@@ -51,6 +51,14 @@ type Event struct {
 	UploadActiveMS        int64  `json:"upload_active_ms,omitempty"`
 	DownloadActiveMS      int64  `json:"download_active_ms,omitempty"`
 	DroppedEvents         uint64 `json:"dropped_events,omitempty"`
+	// Reason, K and TTLMS describe route_ejected and route_restored events.
+	Reason string `json:"reason,omitempty"`
+	K      int    `json:"k,omitempty"`
+	TTLMS  int64  `json:"ttl_ms,omitempty"`
+	// SuppressedCount is set on the request event that closes a no-route
+	// merge window: the number of no-route failures for the destination the
+	// window did not report one by one, this one included.
+	SuppressedCount int `json:"suppressed_count,omitempty"`
 }
 
 type Route struct {
@@ -172,6 +180,20 @@ var defaultEmitter atomic.Pointer[emitter]
 
 func init() {
 	defaultEmitter.Store(newEmitter(os.Getenv(socketEnvironment)))
+	pineroute.SetRouteEventSink(emitRouteEvent)
+}
+
+func emitRouteEvent(event pineroute.RouteEvent) {
+	Emit(Event{
+		Kind:         event.Kind,
+		RouteID:      event.RouteID,
+		SourceListID: event.SourceListID,
+		Tier:         event.Tier,
+		RouteKind:    "managed",
+		Reason:       event.Reason,
+		K:            event.K,
+		TTLMS:        event.TTL.Milliseconds(),
+	})
 }
 
 func Emit(event Event) {
