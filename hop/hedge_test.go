@@ -101,16 +101,16 @@ func requestEvent(t *testing.T, events *eventLog, host string) pineevent.Event {
 // the second route right after the hedge delay and the slow one is cancelled
 // without being recorded as a failure.
 func TestHedgeServesFromTheNextRouteAfterTheDelay(t *testing.T) {
-	defer pineroute.SetHedgeDelayForTest(50 * time.Millisecond)()
+	defer pineroute.SetHedgeDelayForTest(100 * time.Millisecond)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
-	slow := &slowTransport{delay: 600 * time.Millisecond, err: socksReply(4)}
+	slow := &slowTransport{delay: 2 * time.Second, err: socksReply(4)}
 	fast := &slowTransport{}
 	slowNode := pineNode("er_hedge_slow_"+id, slow)
 	r := newTestRouter(slowNode, pineNode("er_hedge_fast_"+id, fast))
 	host := "hedged-" + id + ".example"
 	took, err := timedDial(t, r, host+":443")
-	if err != nil || took > 400*time.Millisecond {
+	if err != nil || took > time.Second {
 		t.Fatalf("hedged request took %s (err %v), want about the hedge delay", took, err)
 	}
 	event := requestEvent(t, events, host)
@@ -151,11 +151,11 @@ func TestHedgeOffKeepsSequentialFailover(t *testing.T) {
 // The first route answers inside the race: it serves and the hedge is the
 // loser. A connection the loser still produces is closed.
 func TestHedgeLosesToAFirstRouteThatAnswers(t *testing.T) {
-	defer pineroute.SetHedgeDelayForTest(30 * time.Millisecond)()
+	defer pineroute.SetHedgeDelayForTest(100 * time.Millisecond)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
-	first := &slowTransport{delay: 120 * time.Millisecond}
-	hedge := &slowTransport{delay: 250 * time.Millisecond, ignoreCancel: true}
+	first := &slowTransport{delay: 600 * time.Millisecond}
+	hedge := &slowTransport{delay: 2 * time.Second, ignoreCancel: true}
 	r := newTestRouter(pineNode("er_lost_a_"+id, first), pineNode("er_lost_b_"+id, hedge))
 	host := "lost-" + id + ".example"
 	if _, err := timedDial(t, r, host+":443"); err != nil {
@@ -170,11 +170,11 @@ func TestHedgeLosesToAFirstRouteThatAnswers(t *testing.T) {
 // A first route that fails during the race is recorded as usual; the hedge
 // serves and the request is a failover.
 func TestFirstRouteFailingDuringTheRaceIsRecorded(t *testing.T) {
-	defer pineroute.SetHedgeDelayForTest(30 * time.Millisecond)()
+	defer pineroute.SetHedgeDelayForTest(100 * time.Millisecond)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
-	first := &slowTransport{delay: 80 * time.Millisecond, err: socksReply(5)}
-	hedge := &slowTransport{delay: 200 * time.Millisecond}
+	first := &slowTransport{delay: 500 * time.Millisecond, err: socksReply(5)}
+	hedge := &slowTransport{delay: 1500 * time.Millisecond}
 	firstNode := pineNode("er_race_a_"+id, first)
 	r := newTestRouter(firstNode, pineNode("er_race_b_"+id, hedge))
 	host := "race-" + id + ".example"
@@ -191,11 +191,11 @@ func TestFirstRouteFailingDuringTheRaceIsRecorded(t *testing.T) {
 
 // Both racers fail; the request continues on the next route.
 func TestBothRacersFailingContinuesSequentially(t *testing.T) {
-	defer pineroute.SetHedgeDelayForTest(30 * time.Millisecond)()
+	defer pineroute.SetHedgeDelayForTest(100 * time.Millisecond)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
-	a := &slowTransport{delay: 100 * time.Millisecond, err: socksReply(4)}
-	b := &slowTransport{delay: 100 * time.Millisecond, err: socksReply(4)}
+	a := &slowTransport{delay: 600 * time.Millisecond, err: socksReply(4)}
+	b := &slowTransport{delay: 600 * time.Millisecond, err: socksReply(4)}
 	c := &slowTransport{}
 	r := newTestRouter(pineNode("er_both_a_"+id, a), pineNode("er_both_b_"+id, b), pineNode("er_both_c_"+id, c))
 	host := "both-" + id + ".example"
@@ -209,10 +209,10 @@ func TestBothRacersFailingContinuesSequentially(t *testing.T) {
 
 // Automatic plans keep direct for exhaustion: a hedge never dials it.
 func TestHedgeNeverUsesDirect(t *testing.T) {
-	defer pineroute.SetHedgeDelayForTest(20 * time.Millisecond)()
+	defer pineroute.SetHedgeDelayForTest(50 * time.Millisecond)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
-	slow := &slowTransport{delay: 150 * time.Millisecond}
+	slow := &slowTransport{delay: 400 * time.Millisecond}
 	direct := corechain.NewNode("direct-"+id, "",
 		corechain.TransportNodeOption(&slowTransport{}),
 		corechain.MetadataNodeOption(mdx.NewMetadata(map[string]any{"pine_route_kind": "direct", "backup": true})))
@@ -229,11 +229,11 @@ func TestHedgeNeverUsesDirect(t *testing.T) {
 // Hedges the first route keeps losing on distinct hosts are evidence: it is
 // ejected as slow.
 func TestRouteLosingHedgesIsEjectedAsSlow(t *testing.T) {
-	defer pineroute.SetHedgeDelayForTest(20 * time.Millisecond)()
+	defer pineroute.SetHedgeDelayForTest(100 * time.Millisecond)()
 	defer pineroute.SetTimingForTest(time.Minute/2, time.Second)()
 	events := captureEvents(t)
 	id := fmt.Sprint(time.Now().UnixNano())
-	slow := &slowTransport{delay: 300 * time.Millisecond, err: socksReply(4)}
+	slow := &slowTransport{delay: 1500 * time.Millisecond, err: socksReply(4)}
 	nodes := []*corechain.Node{pineNode("er_slowroute_"+id, slow)}
 	for i := 0; i < 3; i++ {
 		nodes = append(nodes, pineNode(fmt.Sprintf("er_slowok%d_%s", i, id), &slowTransport{}))

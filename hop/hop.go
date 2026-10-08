@@ -157,6 +157,11 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		if node == nil {
 			continue
 		}
+		// Without escalation nothing is merged: keep the cheap exclusion first,
+		// so bypass plugins are not asked about routes already excluded.
+		if !pineroute.Escalation && pineroute.Skip(ctx, node, options.Network, options.Host) {
+			continue
+		}
 		// node level bypass
 		if node.Options().Bypass != nil &&
 			node.Options().Bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOpton(options.Host)) {

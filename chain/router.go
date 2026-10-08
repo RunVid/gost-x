@@ -280,9 +280,11 @@ func (r *Router) launch(ctx context.Context, network, address string, index int,
 	// excluded, so fail instead of falling through to GOST's implicit
 	// direct route.
 	if pineroute.Enabled && r.options.Chain != nil && (route == nil || len(route.Nodes()) == 0) {
+		// The attempt's own deadline (selection used it) wins, as before.
+		stopped := attemptCtx.Err()
 		cancel()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		if stopped != nil {
+			return nil, stopped
 		}
 		return nil, pineroute.ErrNoRoute
 	}
