@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-gost/core/bypass"
 	corechain "github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
 	"github.com/go-gost/core/routing"
@@ -968,3 +969,53 @@ func TestNoRouteFromOtherExclusionsIsNotMerged(t *testing.T) {
 type neverMatches struct{}
 
 func (neverMatches) Match(*routing.Request) bool { return false }
+
+// bypassAll excludes every destination, like an ISP node kept for login sites
+// when the destination is not one.
+type bypassAll struct{}
+
+func (bypassAll) Contains(context.Context, string, string, ...bypass.Option) bool { return true }
+func (bypassAll) IsWhitelist() bool                                               { return false }
+
+// INT B (2026-10-07): a US hop held 5 ISP nodes that node bypass excludes for
+// non-login sites; with every managed route refusing the destination, the
+// storm must still be merged.
+func TestNoRouteStormMergesWithBypassedNodesInTheHop(t *testing.T) {
+	defer pineroute.SetTimingForTest(time.Minute/2, time.Minute)()
+	events := captureEvents(t)
+	id := fmt.Sprint(time.Now().UnixNano())
+	host := "private-" + id + ".example"
+	isp := pineNode("er_isp_"+id, &refusingTransport{})
+	isp.Options().Bypass = bypassAll{}
+	r := newTestRouter(
+		pineNode("er_bp_a_"+id, &refusingTransport{refused: map[string]error{host: socksReply(2)}}),
+		pineNode("er_bp_b_"+id, &refusingTransport{refused: map[string]error{host: socksReply(4)}}),
+		isp)
+	if err := dial(t, r, host+":80"); err == nil {
+		t.Fatal("precondition: every managed route refuses")
+	}
+	for i := 0; i < 20; i++ {
+		if err := dial(t, r, host+":80"); !errors.Is(err, pineroute.ErrNoRoute) {
+			t.Fatalf("want no_route, got %v", err)
+		}
+	}
+	noRoute := events.match(func(event pineevent.Event) bool {
+		return event.Kind == "request" && event.DestinationHost == host && event.ErrorClass == "no_route"
+	})
+	if len(noRoute) != 1 {
+		t.Fatalf("%d no_route events reported at once for 20 failures, want 1 leader", len(noRoute))
+	}
+	// A hop whose every node is bypassed for the destination is a
+	// configuration gap, reported one by one.
+	gap := pineNode("er_gap_"+id, &refusingTransport{})
+	gap.Options().Bypass = bypassAll{}
+	only := newTestRouter(gap)
+	for i := 0; i < 3; i++ {
+		_ = dial(t, only, "gap-"+id+".example:80")
+	}
+	if n := len(events.match(func(event pineevent.Event) bool {
+		return event.Kind == "request" && event.DestinationHost == "gap-"+id+".example"
+	})); n != 3 {
+		t.Fatalf("%d events for 3 all-bypassed requests, want 3", n)
+	}
+}

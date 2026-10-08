@@ -148,16 +148,13 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	all := p.Nodes()
 	pineroute.NoteHop(ctx, all)
 	var nodes []*chain.Node
-	present, refused := 0, 0
+	// eligible counts nodes this destination may use at all; refused counts
+	// those of them its per-destination refusals exclude. Nodes left out by
+	// bypass, matcher or filter (an ISP route kept for login sites) are not
+	// candidates, so they do not stop a no-route storm from being merged.
+	eligible, refused := 0, 0
 	for _, node := range all {
 		if node == nil {
-			continue
-		}
-		present++
-		if pineroute.Skip(ctx, node, options.Network, options.Host) {
-			if pineroute.Refused(ctx, node, options.Network, options.Host) {
-				refused++
-			}
 			continue
 		}
 		// node level bypass
@@ -186,9 +183,16 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 			}
 		}
 
+		eligible++
+		if pineroute.Skip(ctx, node, options.Network, options.Host) {
+			if pineroute.Refused(ctx, node, options.Network, options.Host) {
+				refused++
+			}
+			continue
+		}
 		nodes = append(nodes, node)
 	}
-	if len(nodes) == 0 && present > 0 && refused == present {
+	if len(nodes) == 0 && eligible > 0 && refused == eligible {
 		pineroute.NoteAllRefused(ctx)
 	}
 	if preferred := pineroute.WithoutEjected(nodes); len(preferred) > 0 {
