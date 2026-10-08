@@ -24,6 +24,7 @@ type slowTransport struct {
 	err          error
 	ignoreCancel bool
 	connects     atomic.Int32
+	firstDial    atomic.Int64 // unix nanos of the first dial
 	canceled     atomic.Int32
 	closed       atomic.Int32
 	options      corechain.TransportOptions
@@ -41,6 +42,7 @@ func (c *closeCountingConn) Close() error {
 }
 
 func (t *slowTransport) Dial(context.Context, string) (net.Conn, error) {
+	t.firstDial.CompareAndSwap(0, time.Now().UnixNano())
 	client, peer := net.Pipe()
 	go func() {
 		defer peer.Close()
@@ -112,6 +114,11 @@ func TestHedgeServesFromTheNextRouteAfterTheDelay(t *testing.T) {
 	took, err := timedDial(t, r, host+":443")
 	if err != nil || took > time.Second {
 		t.Fatalf("hedged request took %s (err %v), want about the hedge delay", took, err)
+	}
+	// The hedge starts only after the delay, never at once (half the delay:
+	// the first dial is stamped a little after the router started it).
+	if gap := time.Duration(fast.firstDial.Load() - slow.firstDial.Load()); gap < 50*time.Millisecond {
+		t.Fatalf("the hedge started %s after the first route, want about the 100 ms delay", gap)
 	}
 	event := requestEvent(t, events, host)
 	if event.Hedge != "won" || event.Outcome != "success" || event.Attempts != 2 || event.RouteID != "er_hedge_fast_"+id {
