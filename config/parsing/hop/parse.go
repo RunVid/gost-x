@@ -185,26 +185,24 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 		)))
 	}
 	if cfg.Metadata != nil {
-		// Pine per-site affinity: the coordinator renders the switch,
-		// Chrome's timezone and the login-site list with the routes, so a
-		// reload changes them together.
+		// Pine sticky route: the coordinator renders the switch and Chrome's
+		// timezone with the routes, so a reload changes them together.
 		md := metadata.NewMetadata(cfg.Metadata)
-		if mdutil.GetBool(md, "pine_site_affinity") && !affinityCompatible(cfg) {
-			log.Warnf("hop %s: pine_site_affinity needs the fifo selector and no node matchers; affinity is off", cfg.Name)
-		} else if mdutil.GetBool(md, "pine_site_affinity") {
-			if affinity := pineroute.NewAffinity(mdutil.GetString(md, "pine_plan_tz"),
-				mdutil.GetStrings(md, "pine_login_sites")); affinity != nil {
-				opts = append(opts, xhop.AffinityOption(affinity))
+		if mdutil.GetBool(md, "pine_sticky_route") && !stickyCompatible(cfg) {
+			log.Warnf("hop %s: pine_sticky_route needs the fifo selector and no node matchers; sticky route is off", cfg.Name)
+		} else if mdutil.GetBool(md, "pine_sticky_route") {
+			if sticky := pineroute.NewSticky(cfg.Name, mdutil.GetString(md, "pine_plan_tz")); sticky != nil {
+				opts = append(opts, xhop.StickyOption(sticky))
 			}
 		}
 	}
 	return xhop.NewHop(opts...), nil
 }
 
-// affinityCompatible reports whether a hop can run Pine site affinity, which
+// stickyCompatible reports whether a hop can run Pine's sticky route, which
 // relies on fifo order: another strategy (round robin is the default) would
-// reorder routes, and a node matcher's priority would override the pin.
-func affinityCompatible(cfg *config.HopConfig) bool {
+// reorder routes, and a node matcher's priority would override the order.
+func stickyCompatible(cfg *config.HopConfig) bool {
 	if cfg.Selector == nil || cfg.Selector.Strategy != "fifo" && cfg.Selector.Strategy != "ha" {
 		return false
 	}

@@ -176,8 +176,8 @@ type attempts struct {
 	allRefused bool
 	panicked   bool
 	request    context.Context
-	// site is the request's per-site affinity state, if any.
-	site *SiteSelection
+	// sticky is the request's sticky-route state, if any.
+	sticky *StickySelection
 }
 
 // WithAttempts returns a context that tracks the routes tried by one router
@@ -383,22 +383,6 @@ func (c *refusalCache) contains(route routeKey, network, address string, now tim
 		return false
 	}
 	return now.Before(entry.expires)
-}
-
-// lookup reports whether route is refused for address, and whether the
-// entry is a policy refusal.
-func (c *refusalCache) lookup(route routeKey, network, address string, now time.Time) (refused, policy bool) {
-	key, ok := refusalKey(route, network, address)
-	if !ok {
-		return false, false
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, ok := c.entries[key]
-	if !ok || !now.Before(entry.expires) {
-		return false, false
-	}
-	return true, entry.class == classPolicy
 }
 
 func (c *refusalCache) remove(route routeKey, network, address string) {

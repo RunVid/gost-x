@@ -33,7 +33,7 @@ type options struct {
 	httpLoader  loader.Loader
 	period      time.Duration
 	logger      logger.Logger
-	affinity    *pineroute.Affinity
+	sticky      *pineroute.Sticky
 }
 
 type Option func(*options)
@@ -85,10 +85,10 @@ func HTTPLoaderOption(httpLoader loader.Loader) Option {
 	}
 }
 
-// AffinityOption turns on Pine per-site route affinity for the hop.
-func AffinityOption(affinity *pineroute.Affinity) Option {
+// StickyOption turns on Pine's sticky route for the hop.
+func StickyOption(sticky *pineroute.Sticky) Option {
 	return func(opts *options) {
-		opts.affinity = affinity
+		opts.sticky = sticky
 	}
 }
 
@@ -156,37 +156,12 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 
 	all := p.Nodes()
 	pineroute.NoteHop(ctx, all)
-	site := pineroute.Site(ctx, options.Network, options.Host, p.options.affinity)
-	if site != nil && hasMatcher(all) {
-		// A matcher's priority would override the pin (loaders can add
-		// matcher nodes after parsing); such hops stay plain fifo.
-		site = nil
-	}
 	var nodes []*chain.Node
-	var pinned *chain.Node
-	pinnedOffered := false
 	// eligible counts nodes this destination may use at all (bypass, matcher
 	// and filter applied); refused counts those its refusals exclude.
 	eligible, refused := 0, 0
 	for _, node := range all {
 		if node == nil {
-			continue
-		}
-		if site != nil && p.offered(ctx, node, &options) {
-			// The first node offered for this host is the site's default
-			// route, whatever its transient state; it needs no pin.
-			site.SetDefault(node)
-		}
-		if site.IsPinned(node) {
-			// Judged by selectPinned below, which may hold a login site on
-			// it through a transient refusal.
-			pinned, pinnedOffered = node, p.offered(ctx, node, &options)
-			if pinnedOffered {
-				eligible++
-				if pineroute.Refused(ctx, node, options.Network, options.Host) {
-					refused++
-				}
-			}
 			continue
 		}
 		if !pineroute.Escalation() && pineroute.Skip(ctx, node, options.Network, options.Host) {
@@ -227,96 +202,55 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		}
 		nodes = append(nodes, node)
 	}
-	if site.Pinned() {
-		node, done, keep := p.selectPinned(ctx, site, pinned, pinnedOffered, &options)
-		if done {
-			return node
-		}
-		if keep {
-			nodes = append(nodes, pinned)
-		}
-	}
 	if len(nodes) == 0 && eligible > 0 && refused == eligible {
 		pineroute.NoteAllRefused(ctx)
 	}
+	sticky := p.sticky(ctx, all, &options)
+	nodes = sticky.Order(all, nodes, func(node *chain.Node) bool {
+		return p.selectNode(ctx, []*chain.Node{node, node.Copy()}) == nil
+	})
 	if preferred := pineroute.WithoutEjected(nodes); len(preferred) > 0 {
 		if node := p.selectPreferred(ctx, preferred); node != nil {
 			return node
 		}
 	}
 	if node := p.selectNode(ctx, nodes); node != nil {
+		// Last resorts never become the current route: an ejected route, or
+		// a lone candidate (it passes unjudged) the filters hold back.
+		if pineroute.Ejected(node) || len(nodes) == 1 && p.selectNode(ctx, []*chain.Node{node, node.Copy()}) == nil {
+			sticky.MarkLastResort(node)
+		}
 		return node
 	}
-	return pineroute.PanicSelect(ctx, nodes)
+	// Every candidate is ejected or cooling down: try one anyway rather than
+	// fail the request with no route. Never the current route either.
+	node := pineroute.PanicSelect(ctx, nodes)
+	sticky.MarkLastResort(node)
+	return node
 }
 
-func hasMatcher(nodes []*chain.Node) bool {
-	for _, node := range nodes {
-		if node != nil && node.Options().Matcher != nil {
-			return true
+// sticky returns the request's sticky-route state, or nil when the hop has
+// none, a node matcher could override the order (loaders can add matcher
+// nodes after parsing), or the host is offered an ISP route: ISP login hosts
+// keep their own order and do not touch the current route.
+func (p *chainHop) sticky(ctx context.Context, all []*chain.Node, options *hop.SelectOptions) *pineroute.StickySelection {
+	if p.options.sticky == nil {
+		return nil
+	}
+	for _, node := range all {
+		if node == nil {
+			continue
+		}
+		if node.Options().Matcher != nil {
+			return nil
+		}
+		if md := node.Options().Metadata; md != nil && md.Get("pine_tier") == "isp" &&
+			(node.Options().Bypass == nil ||
+				!node.Options().Bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOpton(options.Host))) {
+			return nil
 		}
 	}
-	return false
-}
-
-// offered reports whether the hop offers node for this request's host: its
-// node-level bypass and filter (affinity is off on hops with matchers).
-func (p *chainHop) offered(ctx context.Context, node *chain.Node, options *hop.SelectOptions) bool {
-	return (node.Options().Bypass == nil ||
-		!node.Options().Bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOpton(options.Host))) &&
-		p.isEligible(node, options)
-}
-
-// selectPinned decides whether the request uses its site's pinned route.
-// done means Select returns node: the pinned route, or nil when a held login
-// site must fail instead of moving. Otherwise the request continues in fifo
-// order, with the pinned route kept as a candidate when keep is set. A
-// reason recorded with Move lets the router re-pin on success; without one
-// the request is a detour that leaves the pin in place. Precedence: removed,
-// not offered, outside Chrome's timezone, ejected, failed in this request,
-// refused, cooling down.
-func (p *chainHop) selectPinned(ctx context.Context, site *pineroute.SiteSelection, pinned *chain.Node, offered bool, options *hop.SelectOptions) (node *chain.Node, done, keep bool) {
-	switch {
-	case pinned == nil:
-		site.Move(pineroute.MoveRouteRemoved)
-		return nil, false, false
-	case !offered:
-		// Not offered for this host: serve it elsewhere, keep the pin.
-		return nil, false, false
-	case !site.PinAllowed(pinned):
-		// Its exit is no longer in Chrome's timezone (requalified, or the
-		// plan lost the timezone): drop the pin, keep the route in fifo.
-		site.Move(pineroute.MoveRouteRemoved)
-		return nil, false, !pineroute.Skip(ctx, pinned, options.Network, options.Host)
-	case pineroute.Ejected(pinned):
-		// Route-wide ejection moves every site, login sites included. The
-		// route stays a last resort unless this request cannot use it.
-		site.Move(pineroute.MoveRouteEjected)
-		return nil, false, !pineroute.Skip(ctx, pinned, options.Network, options.Host)
-	case pineroute.Tried(ctx, pinned):
-		// Failed in this request: AffinityAttempt decided to stop, move or
-		// detour.
-		return nil, site.Stopped(), false
-	}
-	if refused, policy := pineroute.RefusedFor(pinned, options.Network, options.Host); refused {
-		if policy || !site.Hold() {
-			site.Move(pineroute.MoveSiteRefused)
-			return nil, false, false
-		}
-		return pinned, true, false
-	}
-	// The pair is judged by the selector's filters like any candidate set:
-	// the cooldown applies, and backup suppression does not (both copies are
-	// backups or neither is), so a site pinned to a fallback stays on it.
-	if p.selectNode(ctx, []*chain.Node{pinned, pinned.Copy()}) == nil {
-		// Cooling down after a route failure: login sites wait for it,
-		// other sites detour until it recovers.
-		if site.HoldRouteFailure() {
-			return pinned, true, false
-		}
-		return nil, false, true
-	}
-	return pinned, true, false
+	return pineroute.StickyFor(ctx, options.Network, p.options.sticky)
 }
 
 // selectPreferred selects among non-ejected nodes with the hop's selector.
@@ -342,8 +276,8 @@ func (p *chainHop) selectNode(ctx context.Context, nodes []*chain.Node) *chain.N
 		return nodes[0]
 	}
 
-	// Stable: the caller's order (fifo, or a site's rendezvous order) must
-	// survive among equal priorities.
+	// Stable: the caller's order (fifo, or the sticky order) must survive
+	// among equal priorities.
 	sort.SliceStable(nodes, func(i, j int) bool {
 		return nodes[i].Options().Priority > nodes[j].Options().Priority
 	})
@@ -534,5 +468,5 @@ func (p *chainHop) Close() error {
 	return nil
 }
 
-// AffinityForTest returns the hop's affinity configuration. For tests.
-func (p *chainHop) AffinityForTest() *pineroute.Affinity { return p.options.affinity }
+// StickyForTest returns the hop's sticky-route configuration. For tests.
+func (p *chainHop) StickyForTest() *pineroute.Sticky { return p.options.sticky }
