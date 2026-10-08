@@ -247,6 +247,11 @@ func (r *Router) launch(ctx context.Context, network, address string, index int,
 	} else {
 		attemptCtx, cancel = context.WithCancel(ctx)
 	}
+	if hedge && ictx.BufferFromContext(ctx) != nil {
+		// A hedge runs next to the first attempt: give it its own recorder
+		// buffer so nested dials of the two never share one.
+		attemptCtx = ictx.ContextWithBuffer(attemptCtx, &bytes.Buffer{})
+	}
 
 	buf := ictx.BufferFromContext(ctx)
 	if buf != nil && !hedge {

@@ -24,6 +24,7 @@ type slowTransport struct {
 	err          error
 	ignoreCancel bool
 	connects     atomic.Int32
+	dials        atomic.Int32
 	firstDial    atomic.Int64 // unix nanos of the first dial
 	canceled     atomic.Int32
 	closed       atomic.Int32
@@ -43,6 +44,7 @@ func (c *closeCountingConn) Close() error {
 
 func (t *slowTransport) Dial(context.Context, string) (net.Conn, error) {
 	t.firstDial.CompareAndSwap(0, time.Now().UnixNano())
+	t.dials.Add(1)
 	client, peer := net.Pipe()
 	go func() {
 		defer peer.Close()
@@ -268,8 +270,8 @@ func TestRouteLosingHedgesIsEjectedAsSlow(t *testing.T) {
 func TestConcurrentHedgedRequests(t *testing.T) {
 	defer pineroute.SetHedgeDelayForTest(5 * time.Millisecond)()
 	id := fmt.Sprint(time.Now().UnixNano())
-	a := &slowTransport{delay: 20 * time.Millisecond}
-	b := &slowTransport{delay: 15 * time.Millisecond}
+	a := &slowTransport{delay: 20 * time.Millisecond, ignoreCancel: true}
+	b := &slowTransport{delay: 15 * time.Millisecond, ignoreCancel: true}
 	r := newTestRouter(pineNode("er_conc_a_"+id, a), pineNode("er_conc_b_"+id, b))
 	var wg sync.WaitGroup
 	var failures atomic.Int32
@@ -286,4 +288,9 @@ func TestConcurrentHedgedRequests(t *testing.T) {
 	if failures.Load() != 0 {
 		t.Fatalf("%d concurrent hedged requests failed", failures.Load())
 	}
+	// Every connection either served (closed by the caller) or lost and was
+	// closed by the router, including losers that ignored cancellation.
+	waitFor(t, "every dialed connection closed", func() bool {
+		return a.closed.Load()+b.closed.Load() == a.dials.Load()+b.dials.Load()
+	})
 }
