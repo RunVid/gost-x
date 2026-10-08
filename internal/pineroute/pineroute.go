@@ -175,7 +175,9 @@ type attempts struct {
 	hops map[incarnation][]incarnation
 	// allRefused: see NoteAllRefused.
 	allRefused bool
-	request    context.Context
+	// hedgeWon: see MarkHedgeWon.
+	hedgeWon bool
+	request  context.Context
 }
 
 // WithAttempts returns a context that tracks the routes tried by one router
@@ -425,8 +427,10 @@ func managedIncarnation(node *chain.Node) (incarnation, bool) {
 // transient reply. It is charged only if another route then reaches the same
 // dialed address within the same request.
 type suspect struct {
-	route  incarnation
-	info   routeInfo
+	route incarnation
+	info  routeInfo
+	// slow marks a route that had not answered when a hedge connected.
+	slow   bool
 	host   string
 	dialed string
 	at     time.Time
@@ -488,7 +492,11 @@ func BlameSuspects(ctx context.Context, winner *chain.Node, network, dialed stri
 			continue
 		}
 		if defaultEscalations.charge(s.route, s.host, s.at, now) {
-			defaultEjections.eject(s.route, s.info, hopOf(ctx, s.route), ReasonDestinationFailures)
+			reason := ReasonDestinationFailures
+			if s.slow {
+				reason = ReasonSlow
+			}
+			defaultEjections.eject(s.route, s.info, hopOf(ctx, s.route), reason)
 		} else {
 			defaultEjections.noteBad(s.route)
 		}

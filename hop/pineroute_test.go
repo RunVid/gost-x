@@ -901,13 +901,19 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 	stormRequests := func() []pineevent.Event {
 		return events.match(func(event pineevent.Event) bool { return event.Kind == "request" && event.DestinationHost == host })
 	}
-	waitFor(t, "summary", func() bool {
+	// Wait until every window has closed: leaders plus suppressed failures
+	// account for the whole burst.
+	waitFor(t, "every window's summary", func() bool {
+		total := 0
 		for _, event := range stormRequests() {
-			if event.SuppressedCount > 0 {
-				return true
+			if event.ErrorClass == "no_route" {
+				if event.SuppressedCount == 0 {
+					total++
+				}
+				total += event.SuppressedCount
 			}
 		}
-		return false
+		return total >= 1000
 	})
 	var noRoute, leaders, suppressed int
 	for _, event := range stormRequests() {
