@@ -64,6 +64,19 @@ func NewSticky(hop, timeZone string) *Sticky {
 	return sticky
 }
 
+// DisableSticky is a config load of hop without a sticky route: requests
+// selected under an earlier load can no longer promote.
+func DisableSticky(hop string) {
+	v, ok := stickyStates.Load(hop)
+	if !ok {
+		return
+	}
+	state := v.(*stickyState)
+	state.mu.Lock()
+	state.config = nil
+	state.mu.Unlock()
+}
+
 // Current returns the hop's current route ID ("" before the first success).
 func (s *Sticky) Current() string {
 	route, _ := s.state.get()

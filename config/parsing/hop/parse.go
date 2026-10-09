@@ -184,6 +184,7 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 			loader.TimeoutHTTPLoaderOption(cfg.HTTP.Timeout),
 		)))
 	}
+	var sticky *pineroute.Sticky
 	if cfg.Metadata != nil {
 		// Pine sticky route: the coordinator renders the switch and Chrome's
 		// timezone with the routes, so a reload changes them together.
@@ -191,10 +192,13 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 		if mdutil.GetBool(md, "pine_sticky_route") && !stickyCompatible(cfg) {
 			log.Warnf("hop %s: pine_sticky_route needs the fifo selector and no node matchers; sticky route is off", cfg.Name)
 		} else if mdutil.GetBool(md, "pine_sticky_route") {
-			if sticky := pineroute.NewSticky(cfg.Name, mdutil.GetString(md, "pine_plan_tz")); sticky != nil {
-				opts = append(opts, xhop.StickyOption(sticky))
-			}
+			sticky = pineroute.NewSticky(cfg.Name, mdutil.GetString(md, "pine_plan_tz"))
 		}
+	}
+	if sticky != nil {
+		opts = append(opts, xhop.StickyOption(sticky))
+	} else {
+		pineroute.DisableSticky(cfg.Name)
 	}
 	return xhop.NewHop(opts...), nil
 }
