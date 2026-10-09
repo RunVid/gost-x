@@ -16,7 +16,7 @@ import (
 
 func TestMain(m *testing.M) {
 	Enabled = true
-	Escalation = true
+	SetEscalationForTest(true)
 	m.Run()
 }
 

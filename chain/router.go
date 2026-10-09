@@ -176,6 +176,21 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 			if err == nil {
 				pineroute.RecordSuccess(ctx, node, network, address)
 				pineroute.BlameSuspects(ctx, node, network, ipAddr)
+				if move := pineroute.StickySuccess(ctx, node); move != nil {
+					pineevent.Emit(pineevent.Event{
+						Kind:            "route_moved",
+						ConnectionID:    xctx.SidFromContext(ctx).String(),
+						Network:         network,
+						DestinationHost: destinationHost,
+						DestinationPort: destinationPort,
+						RouteID:         selectedRoute.RouteID,
+						SourceListID:    selectedRoute.SourceListID,
+						Tier:            selectedRoute.Tier,
+						RouteKind:       selectedRoute.Kind,
+						FromRouteID:     move.FromRoute,
+						Reason:          move.Reason,
+					})
+				}
 			} else {
 				pineroute.NoteSuspect(ctx, node, network, address, ipAddr, err)
 			}

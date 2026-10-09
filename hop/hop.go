@@ -33,6 +33,7 @@ type options struct {
 	httpLoader  loader.Loader
 	period      time.Duration
 	logger      logger.Logger
+	sticky      *pineroute.Sticky
 }
 
 type Option func(*options)
@@ -83,6 +84,14 @@ func HTTPLoaderOption(httpLoader loader.Loader) Option {
 		opts.httpLoader = httpLoader
 	}
 }
+
+// StickyOption turns on Pine's sticky route for the hop.
+func StickyOption(sticky *pineroute.Sticky) Option {
+	return func(opts *options) {
+		opts.sticky = sticky
+	}
+}
+
 func LoggerOption(logger logger.Logger) Option {
 	return func(opts *options) {
 		opts.logger = logger
@@ -155,7 +164,7 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		if node == nil {
 			continue
 		}
-		if !pineroute.Escalation && pineroute.Skip(ctx, node, options.Network, options.Host) {
+		if !pineroute.Escalation() && pineroute.Skip(ctx, node, options.Network, options.Host) {
 			continue
 		}
 		// node level bypass
@@ -196,15 +205,52 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	if len(nodes) == 0 && eligible > 0 && refused == eligible {
 		pineroute.NoteAllRefused(ctx)
 	}
+	sticky := p.sticky(ctx, all, &options)
+	nodes = sticky.Order(all, nodes, func(node *chain.Node) bool {
+		return p.selectNode(ctx, []*chain.Node{node, node.Copy()}) == nil
+	})
 	if preferred := pineroute.WithoutEjected(nodes); len(preferred) > 0 {
 		if node := p.selectPreferred(ctx, preferred); node != nil {
 			return node
 		}
 	}
 	if node := p.selectNode(ctx, nodes); node != nil {
+		// Last resorts never become the current route: an ejected route, or
+		// a lone candidate (it passes unjudged) the filters hold back.
+		if pineroute.Ejected(node) || len(nodes) == 1 && p.selectNode(ctx, []*chain.Node{node, node.Copy()}) == nil {
+			sticky.MarkLastResort(node)
+		}
 		return node
 	}
-	return pineroute.PanicSelect(ctx, nodes)
+	// Every candidate is ejected or cooling down: try one anyway rather than
+	// fail the request with no route. Never the current route either.
+	node := pineroute.PanicSelect(ctx, nodes)
+	sticky.MarkLastResort(node)
+	return node
+}
+
+// sticky returns the request's sticky-route state, or nil when the hop has
+// none, a node matcher could override the order (loaders can add matcher
+// nodes after parsing), or the host is offered an ISP route: ISP login hosts
+// keep their own order and do not touch the current route.
+func (p *chainHop) sticky(ctx context.Context, all []*chain.Node, options *hop.SelectOptions) *pineroute.StickySelection {
+	if p.options.sticky == nil {
+		return nil
+	}
+	for _, node := range all {
+		if node == nil {
+			continue
+		}
+		if node.Options().Matcher != nil {
+			return nil
+		}
+		if md := node.Options().Metadata; md != nil && md.Get("pine_tier") == "isp" &&
+			(node.Options().Bypass == nil ||
+				!node.Options().Bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOpton(options.Host))) {
+			return nil
+		}
+	}
+	return pineroute.StickyFor(ctx, options.Network, p.options.sticky)
 }
 
 // selectPreferred selects among non-ejected nodes with the hop's selector.
@@ -230,7 +276,9 @@ func (p *chainHop) selectNode(ctx context.Context, nodes []*chain.Node) *chain.N
 		return nodes[0]
 	}
 
-	sort.Slice(nodes, func(i, j int) bool {
+	// Stable: the caller's order (fifo, or the sticky order) must survive
+	// among equal priorities.
+	sort.SliceStable(nodes, func(i, j int) bool {
 		return nodes[i].Options().Priority > nodes[j].Options().Priority
 	})
 
@@ -419,3 +467,6 @@ func (p *chainHop) Close() error {
 	}
 	return nil
 }
+
+// StickyForTest returns the hop's sticky-route configuration. For tests.
+func (p *chainHop) StickyForTest() *pineroute.Sticky { return p.options.sticky }

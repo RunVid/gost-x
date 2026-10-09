@@ -11,8 +11,7 @@ import (
 
 func withoutEscalation(t *testing.T) {
 	t.Helper()
-	Escalation = false
-	t.Cleanup(func() { Escalation = true })
+	t.Cleanup(SetEscalationForTest(false))
 }
 
 // Without PINE_GOST_ROUTE_EJECTION=on, GOST keeps the #7/#8 rules.

@@ -16,6 +16,7 @@ import (
 	xhop "github.com/go-gost/x/hop"
 	hop_plugin "github.com/go-gost/x/hop/plugin"
 	"github.com/go-gost/x/internal/loader"
+	"github.com/go-gost/x/internal/pineroute"
 	"github.com/go-gost/x/internal/plugin"
 	"github.com/go-gost/x/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
@@ -183,5 +184,36 @@ func ParseHop(cfg *config.HopConfig, log logger.Logger) (hop.Hop, error) {
 			loader.TimeoutHTTPLoaderOption(cfg.HTTP.Timeout),
 		)))
 	}
+	var sticky *pineroute.Sticky
+	if cfg.Metadata != nil {
+		// Pine sticky route: the coordinator renders the switch and Chrome's
+		// timezone with the routes, so a reload changes them together.
+		md := metadata.NewMetadata(cfg.Metadata)
+		if mdutil.GetBool(md, "pine_sticky_route") && !stickyCompatible(cfg) {
+			log.Warnf("hop %s: pine_sticky_route needs the fifo selector and no node matchers; sticky route is off", cfg.Name)
+		} else if mdutil.GetBool(md, "pine_sticky_route") {
+			sticky = pineroute.NewSticky(cfg.Name, mdutil.GetString(md, "pine_plan_tz"))
+		}
+	}
+	if sticky != nil {
+		opts = append(opts, xhop.StickyOption(sticky))
+	} else {
+		pineroute.DisableSticky(cfg.Name)
+	}
 	return xhop.NewHop(opts...), nil
+}
+
+// stickyCompatible reports whether a hop can run Pine's sticky route, which
+// relies on fifo order: another strategy (round robin is the default) would
+// reorder routes, and a node matcher's priority would override the order.
+func stickyCompatible(cfg *config.HopConfig) bool {
+	if cfg.Selector == nil || cfg.Selector.Strategy != "fifo" && cfg.Selector.Strategy != "ha" {
+		return false
+	}
+	for _, node := range cfg.Nodes {
+		if node != nil && node.Matcher != nil {
+			return false
+		}
+	}
+	return true
 }

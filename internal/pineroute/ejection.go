@@ -32,9 +32,19 @@ const (
 	ejectionBaseEnvironment = "PINE_GOST_EJECTION_BASE"
 )
 
-// Escalation turns on the route-health rules of this file, storm.go and the
+// Escalation() turns on the route-health rules of this file, storm.go and the
 // escalating refusal TTLs. Off keeps the fixed #7/#8 rules.
-var Escalation = os.Getenv(escalationEnvironment) == "on"
+var escalation atomic.Bool
+
+func init() { escalation.Store(os.Getenv(escalationEnvironment) == "on") }
+
+func Escalation() bool { return escalation.Load() }
+
+// SetEscalationForTest sets the switch until the returned function runs.
+func SetEscalationForTest(on bool) (restore func()) {
+	previous := escalation.Swap(on)
+	return func() { escalation.Store(previous) }
+}
 
 const escalationEnvironment = "PINE_GOST_ROUTE_EJECTION"
 
@@ -79,7 +89,7 @@ func SetRouteEventSink(sink func(RouteEvent)) {
 }
 
 func emitRouteEvent(event RouteEvent) {
-	if !Escalation {
+	if !Escalation() {
 		return
 	}
 	if sink := routeEventSink.Load(); sink != nil {
@@ -248,7 +258,7 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 		// The ejection ended but its restore timer has not run yet.
 		s.restoreLocked(route, record, record.until)
 	}
-	if !Escalation && record.until.After(now) {
+	if !Escalation() && record.until.After(now) {
 		// #8: fresh evidence renews the fixed quarantine.
 		record.until, record.lastBad = now.Add(s.base), now
 		s.generation++
@@ -258,7 +268,7 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 		s.after(s.base, func() { s.restore(route, generation) })
 		return false
 	}
-	if record.until.After(now) || Escalation && !s.withinCapLocked(route, hop, now) {
+	if record.until.After(now) || Escalation() && !s.withinCapLocked(route, hop, now) {
 		if !record.until.After(now) {
 			s.decayLocked(record, now)
 		}
@@ -267,7 +277,7 @@ func (s *ejectionStore) eject(route incarnation, info routeInfo, hop []incarnati
 		return false
 	}
 	var ttl time.Duration
-	if Escalation {
+	if Escalation() {
 		s.decayLocked(record, now)
 		record.k = min(record.k+1, maxEjectionK)
 		ttl = min(time.Duration(record.k)*s.base, s.max)
@@ -381,7 +391,7 @@ func hopOf(ctx context.Context, route incarnation) []incarnation {
 // RecordRouteFailure ejects node for a failure that counts against the whole
 // route: the cases in which the selector marks the node failed.
 func RecordRouteFailure(ctx context.Context, node *chain.Node, network string, err error) {
-	if !Enabled || !Escalation || err == nil || IgnoreFailure(ctx, node, network, err) {
+	if !Enabled || !Escalation() || err == nil || IgnoreFailure(ctx, node, network, err) {
 		return
 	}
 	route, ok := managedIncarnation(node)
@@ -442,7 +452,7 @@ func WithoutEjected(nodes []*chain.Node) []*chain.Node {
 // before ejected, direct last. A request gets one such attempt, so a dead
 // hop fails after one cooled route's timeout rather than all of them.
 func PanicSelect(ctx context.Context, nodes []*chain.Node) *chain.Node {
-	if !Enabled || !Escalation {
+	if !Enabled || !Escalation() {
 		return nil
 	}
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)

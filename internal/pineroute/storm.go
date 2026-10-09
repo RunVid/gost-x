@@ -75,7 +75,7 @@ func Refused(ctx context.Context, node *chain.Node, network, address string) boo
 // into the open window. When such a window closes, flush runs once with the
 // latest suppressed payload and the count.
 func MergeNoRoute(network, address string, payload any, flush func(last any, suppressed int)) bool {
-	if !Enabled || !Escalation {
+	if !Enabled || !Escalation() {
 		return true
 	}
 	return defaultNoRouteMerger.merge(network, address, payload, flush)
