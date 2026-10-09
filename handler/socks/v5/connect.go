@@ -20,6 +20,7 @@ import (
 	xio "github.com/go-gost/x/internal/io"
 	xnet "github.com/go-gost/x/internal/net"
 	"github.com/go-gost/x/internal/pineevent"
+	"github.com/go-gost/x/internal/pineusage"
 	"github.com/go-gost/x/internal/util/sniffing"
 	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
@@ -151,8 +152,14 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 	// xnet.Transport(conn, cc)
 	clientConn := &countingConn{Conn: conn, startedAt: t}
 	upstreamConn := &countingConn{Conn: cc, startedAt: t}
-	xnet.Pipe(ctx, clientConn, upstreamConn)
 	route, outcome := dialState.SelectedRoute()
+	// Only tunnel payload forwarded through a managed proxy is billable.
+	// SOCKS replies have already been written; direct fallback stays excluded.
+	if route.Kind == "managed" {
+		upstreamConn.usage = &pineusage.Upload
+		clientConn.usage = &pineusage.Download
+	}
+	xnet.Pipe(ctx, clientConn, upstreamConn)
 	destinationHost, destinationPort := pineevent.Destination(address)
 	pineevent.Emit(pineevent.Event{
 		Kind:                  "relay",
@@ -181,6 +188,7 @@ func (h *socks5Handler) handleConnect(ctx context.Context, conn net.Conn, networ
 
 type countingConn struct {
 	net.Conn
+	usage        *atomic.Int64
 	bytesWritten atomic.Int64
 	firstWriteNS atomic.Int64
 	lastWriteNS  atomic.Int64
@@ -197,6 +205,9 @@ func (c *countingConn) Write(payload []byte) (int, error) {
 		c.lastWriteNS.Store(time.Since(c.startedAt).Nanoseconds() + 1)
 	}
 	c.bytesWritten.Add(int64(n))
+	if c.usage != nil && n > 0 {
+		c.usage.Add(int64(n))
+	}
 	return n, err
 }
 

@@ -53,6 +53,8 @@ func Register(r *gin.Engine, opts *Options) {
 
 	router.StaticFS("/docs", http.FS(swaggerDoc))
 
+	router.GET("/usage", mwBasicAuth(opts.Auther), getUsage)
+
 	config := router.Group("/config")
 	config.Use(mwBasicAuth(opts.Auther))
 

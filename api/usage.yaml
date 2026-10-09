@@ -1,0 +1,37 @@
+openapi: 3.1.0
+info:
+  title: Pine GOST private usage counters
+  version: 1.0.0
+paths:
+  /usage:
+    get:
+      operationId: getProxyUsage
+      description: |
+        Process-lifetime counts of successful managed SOCKS5 CONNECT tunnel
+        writes. Upload is payload written to upstream; download is payload
+        written to the client. Direct routes and SOCKS setup are excluded.
+        Reads and configuration reload never reset counts. Each direction is
+        monotonic but the pair is not an atomic snapshot. A new process has a
+        new UUID. Memory snapshots retain UUID and counters; the consumer must
+        use live runtime identity to baseline restored values.
+        The existing admin listener, path prefix and authentication apply.
+      security:
+        - basicAuth: []
+      responses:
+        '200':
+          description: Current counters; no credentials or destination details.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [process_id, upload_bytes, download_bytes]
+                properties:
+                  process_id: {type: string, format: uuid}
+                  upload_bytes: {type: integer, format: int64, minimum: 0}
+                  download_bytes: {type: integer, format: int64, minimum: 0}
+        '401':
+          description: Admin authentication failed.
+components:
+  securitySchemes:
+    basicAuth: {type: http, scheme: basic}
