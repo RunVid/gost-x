@@ -235,6 +235,7 @@ func (r *Router) dial(ctx context.Context, network, address string, log logger.L
 		ErrorClass:      errorClass,
 		SOCKS5Reply:     socks5Reply,
 		FailureCause:    pineroute.FailureCause(ctx, err),
+		Excluded:        pineroute.Exclusions(ctx),
 		DurationMS:      time.Since(startedAt).Milliseconds(),
 	}
 	if attempts == 0 && errors.Is(err, pineroute.ErrNoRoute) && pineroute.AllRefused(ctx) {

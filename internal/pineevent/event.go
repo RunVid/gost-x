@@ -59,6 +59,9 @@ type Event struct {
 	// merge window: the number of no-route failures for the destination the
 	// window did not report one by one, this one included.
 	SuppressedCount int `json:"suppressed_count,omitempty"`
+	// Excluded is set on request events: the plan nodes the request skipped
+	// and never attempted, by reason.
+	Excluded *pineroute.Excluded `json:"excluded,omitempty"`
 }
 
 type Route struct {

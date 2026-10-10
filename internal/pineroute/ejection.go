@@ -338,8 +338,8 @@ func (s *ejectionStore) ejected(route incarnation, now time.Time) bool {
 	return record != nil && record.until.After(now)
 }
 
-// NoteHop records the managed routes of the hop selecting for the request in
-// ctx, by tier. The ejection cap is counted within a tier, so primary routes
+// NoteHop records the nodes of the hop selecting for the request in ctx as
+// its plan, and its managed routes by tier. The ejection cap is counted within a tier, so primary routes
 // cannot all be ejected onto the backup tier.
 func NoteHop(ctx context.Context, nodes []*chain.Node) {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
@@ -358,6 +358,14 @@ func NoteHop(ctx context.Context, nodes []*chain.Node) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.plan == nil {
+		a.plan = map[routeKey]struct{}{}
+	}
+	for _, node := range nodes {
+		if id := nodeRouteKey(node); id != (routeKey{}) {
+			a.plan[id] = struct{}{}
+		}
+	}
 	if a.hops == nil {
 		a.hops = map[incarnation][]incarnation{}
 	}

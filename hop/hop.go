@@ -21,6 +21,7 @@ import (
 	"github.com/go-gost/x/internal/loader"
 	"github.com/go-gost/x/internal/pineroute"
 	xlogger "github.com/go-gost/x/logger"
+	xselector "github.com/go-gost/x/selector"
 )
 
 type options struct {
@@ -156,6 +157,7 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 			continue
 		}
 		if !pineroute.Escalation && pineroute.Skip(ctx, node, options.Network, options.Host) {
+			pineroute.NoteRefusal(ctx, node, options.Network, options.Host)
 			continue
 		}
 		// node level bypass
@@ -188,6 +190,7 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		if pineroute.Skip(ctx, node, options.Network, options.Host) {
 			if pineroute.Refused(ctx, node, options.Network, options.Host) {
 				refused++
+				pineroute.NoteRefusal(ctx, node, options.Network, options.Host)
 			}
 			continue
 		}
@@ -198,6 +201,7 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 	}
 	if preferred := pineroute.WithoutEjected(nodes); len(preferred) > 0 {
 		if node := p.selectPreferred(ctx, preferred); node != nil {
+			pineroute.NoteEjected(ctx, ejected(nodes, preferred)...)
 			return node
 		}
 	}
@@ -239,9 +243,28 @@ func (p *chainHop) selectNode(ctx context.Context, nodes []*chain.Node) *chain.N
 	}
 
 	if s := p.options.selector; s != nil {
+		if pineroute.Tracking(ctx) {
+			pineroute.NoteCooldown(ctx, xselector.FailFiltered(ctx, s, nodes...)...)
+		}
 		return s.Select(ctx, nodes...)
 	}
 	return nodes[0]
+}
+
+// ejected returns the nodes WithoutEjected removed from nodes to leave
+// preferred.
+func ejected(nodes, preferred []*chain.Node) []*chain.Node {
+	kept := make(map[*chain.Node]struct{}, len(preferred))
+	for _, node := range preferred {
+		kept[node] = struct{}{}
+	}
+	var removed []*chain.Node
+	for _, node := range nodes {
+		if _, ok := kept[node]; !ok {
+			removed = append(removed, node)
+		}
+	}
+	return removed
 }
 
 func (p *chainHop) isEligible(node *chain.Node, opts *hop.SelectOptions) bool {

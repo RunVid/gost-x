@@ -176,6 +176,10 @@ type attempts struct {
 	allRefused bool
 	panicked   bool
 	request    context.Context
+	// plan holds every node of the hops that selected for this request, and
+	// excluded the latest reason hop selection skipped each of them for.
+	plan     map[routeKey]struct{}
+	excluded map[routeKey]exclusion
 }
 
 // WithAttempts returns a context that tracks the routes tried by one router
@@ -366,21 +370,27 @@ func (c *refusalCache) evictLocked(now time.Time) {
 }
 
 func (c *refusalCache) contains(route routeKey, network, address string, now time.Time) bool {
+	_, ok := c.lookup(route, network, address, now)
+	return ok
+}
+
+// lookup returns the class of the refusal that excludes the pair now.
+func (c *refusalCache) lookup(route routeKey, network, address string, now time.Time) (refusalClass, bool) {
 	key, ok := refusalKey(route, network, address)
 	if !ok {
-		return false
+		return 0, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[key]
 	if !ok {
-		return false
+		return 0, false
 	}
 	if entry.forgotten(now) || !Escalation && !now.Before(entry.expires) {
 		delete(c.entries, key)
-		return false
+		return 0, false
 	}
-	return now.Before(entry.expires)
+	return entry.class, now.Before(entry.expires)
 }
 
 func (c *refusalCache) remove(route routeKey, network, address string) {

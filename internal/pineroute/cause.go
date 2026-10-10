@@ -74,6 +74,7 @@ func directDestinationFailure(err error) bool {
 
 // FailureCause classifies the request in ctx after its last attempt. err is
 // the request's final error. It returns "" when the first attempt succeeded.
+// A failed request the attempts leave unknown is classified by exclusionCause.
 func FailureCause(ctx context.Context, err error) string {
 	a, _ := ctx.Value(attemptsKey{}).(*attempts)
 	if a == nil {
@@ -81,8 +82,19 @@ func FailureCause(ctx context.Context, err error) string {
 	}
 	a.mu.Lock()
 	records := append([]attemptRecord(nil), a.records...)
+	plan := make(map[routeKey]struct{}, len(a.plan))
+	for id := range a.plan {
+		plan[id] = struct{}{}
+	}
+	excluded := untriedLocked(a)
 	a.mu.Unlock()
-	return failureCause(records, err == nil, err != nil && RequestCanceled(ctx, err))
+	canceled := err != nil && RequestCanceled(ctx, err)
+	cause := failureCause(records, err == nil, canceled)
+	if cause == CauseUnknown && err != nil && !canceled {
+		// What hop selection skipped completes what the attempts show.
+		cause = exclusionCause(records, plan, excluded)
+	}
+	return cause
 }
 
 func failureCause(records []attemptRecord, succeeded, canceled bool) string {

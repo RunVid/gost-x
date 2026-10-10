@@ -912,7 +912,8 @@ func TestNoRouteBurstCollapses(t *testing.T) {
 				leaders++
 			}
 			suppressed += event.SuppressedCount
-			if event.Attempts != 0 || event.FailureCause != "unknown" {
+			if event.Attempts != 0 || event.FailureCause != "vendor_policy" || event.Excluded == nil ||
+				*event.Excluded != (pineroute.Excluded{Policy: 2}) {
 				t.Fatalf("unexpected no_route event %+v", event)
 			}
 		}

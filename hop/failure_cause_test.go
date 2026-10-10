@@ -11,6 +11,7 @@ import (
 
 	corechain "github.com/go-gost/core/chain"
 	"github.com/go-gost/x/internal/pineevent"
+	"github.com/go-gost/x/internal/pineroute"
 	mdx "github.com/go-gost/x/metadata"
 )
 
@@ -57,7 +58,8 @@ func TestRequestEventCarriesFailureCause(t *testing.T) {
 		{"every route refused by policy", []error{socksReply(2), socksReply(2)}, "vendor_policy"},
 		{"no route reaches the site", []error{socksReply(4), socksReply(5), socksReply(4)}, "site"},
 		{"every route address type unsupported", []error{socksReply(8), socksReply(8)}, "unknown"},
-		{"only one route tried", []error{socksReply(4)}, "unknown"},
+		{"single route refused", []error{socksReply(4)}, "site"},
+		{"policy and transient refusals", []error{socksReply(2), socksReply(4)}, "site"},
 		{"every proxy broken", []error{socksReply(1), timeout}, "network"},
 	}
 	for index, tc := range cases {
@@ -96,7 +98,7 @@ func TestSingleRouteUpstreamFailureCauseIsNetwork(t *testing.T) {
 	}
 }
 
-func TestRequestExcludedByRefusalCacheIsUnknown(t *testing.T) {
+func TestRequestExcludedByRefusalCacheIsSite(t *testing.T) {
 	host := fmt.Sprintf("cached-%d.example", time.Now().UnixNano())
 	route := pineNode("er_cached_"+host, &refusingTransport{refused: map[string]error{host: socksReply(4)}})
 	router := newTestRouter(route)
@@ -117,8 +119,9 @@ func TestRequestExcludedByRefusalCacheIsUnknown(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if request == nil || request.Attempts != 0 || request.FailureCause != "unknown" {
-		t.Fatalf("request event = %+v, want no attempt and cause unknown", request)
+	if request == nil || request.Attempts != 0 || request.FailureCause != "site" ||
+		request.Excluded == nil || *request.Excluded != (pineroute.Excluded{Transient: 1}) {
+		t.Fatalf("request event = %+v, want no attempt, one transient exclusion and cause site", request)
 	}
 }
 
