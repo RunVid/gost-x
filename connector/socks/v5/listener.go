@@ -17,7 +17,7 @@ type tcpListener struct {
 
 func (p *tcpListener) Accept() (net.Conn, error) {
 	// second reply, peer connected
-	rep, err := gosocks5.ReadReply(p.conn)
+	rep, err := readReply(p.conn)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +70,7 @@ func (p *tcpMuxListener) Accept() (net.Conn, error) {
 
 func (p *tcpMuxListener) getPeerConn(conn net.Conn) (net.Conn, error) {
 	// second reply, peer connected
-	rep, err := gosocks5.ReadReply(conn)
+	rep, err := readReply(conn)
 	if err != nil {
 		return nil, err
 	}
