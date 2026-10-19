@@ -2,6 +2,7 @@ package v5
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -147,5 +148,45 @@ func (c *streamConn) Read(p []byte) (int, error) {
 	}
 	copy(p, c.data[:n])
 	c.data = c.data[n:]
+	return n, nil
+}
+
+// TestReadReplyPacketConn models dialer/ftcp, where one Read yields one packet:
+// the reply arrives whole and coalesced payload is not lost.
+func TestReadReplyPacketConn(t *testing.T) {
+	packets := [][]byte{
+		append(buildReply(gosocks5.Succeeded, "198.51.100.9", "7070"), "server-first-data"...),
+		[]byte("next-packet"),
+	}
+	c := newReplyConn(&packetConn{packets: packets})
+
+	rep, err := readReply(c)
+	if err != nil {
+		t.Fatalf("readReply: %v", err)
+	}
+	if rep.Addr.Host != "198.51.100.9" || rep.Addr.Port != 7070 {
+		t.Fatalf("Addr = %v", rep.Addr)
+	}
+	rest, _ := io.ReadAll(c)
+	if want := "server-first-datanext-packet"; string(rest) != want {
+		t.Fatalf("remaining = %q, want %q", rest, want)
+	}
+}
+
+// packetConn returns one whole packet per Read and fails on a partial one.
+type packetConn struct {
+	net.Conn
+	packets [][]byte
+}
+
+func (c *packetConn) Read(p []byte) (int, error) {
+	if len(c.packets) == 0 {
+		return 0, io.EOF
+	}
+	if len(c.packets[0]) > len(p) {
+		return 0, errors.New("packet truncated: read buffer smaller than one packet")
+	}
+	n := copy(p, c.packets[0])
+	c.packets = c.packets[1:]
 	return n, nil
 }

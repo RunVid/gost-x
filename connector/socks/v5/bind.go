@@ -104,7 +104,7 @@ func (l *socks5Connector) bind(conn net.Conn, cmd uint8, network, address string
 	}
 
 	// first reply, bind status
-	reply, err := readReply(conn)
+	reply, err := gosocks5.ReadReply(conn)
 	if err != nil {
 		return nil, err
 	}
