@@ -9,16 +9,21 @@ import (
 )
 
 // replyConn buffers the connection for reply parsing so bytes read past a
-// SOCKS5 reply stay readable by the relay. The buffer is filled with
-// reply-sized reads, so packet-backed connections such as dialer/ftcp, whose
-// Read maps to one PacketConn.ReadFrom, still yield a whole reply per call.
+// SOCKS5 reply stay readable by the relay. Reads ask for the full buffer, so
+// packet-backed connections such as dialer/ftcp, whose Read maps to one
+// PacketConn.ReadFrom, take a whole packet (reply plus any server-first
+// payload) instead of losing the tail.
 type replyConn struct {
 	net.Conn
 	r *bufio.Reader
 }
 
+// replyBufSize bounds one read: a SOCKS5 reply is at most 262 bytes, and a
+// packet's remaining payload has to fit too.
+const replyBufSize = 4096
+
 func newReplyConn(c net.Conn) *replyConn {
-	return &replyConn{Conn: c, r: bufio.NewReaderSize(c, 262)}
+	return &replyConn{Conn: c, r: bufio.NewReaderSize(c, replyBufSize)}
 }
 
 func (c *replyConn) Read(p []byte) (int, error) {

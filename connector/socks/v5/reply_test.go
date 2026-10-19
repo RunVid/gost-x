@@ -154,8 +154,11 @@ func (c *streamConn) Read(p []byte) (int, error) {
 // TestReadReplyPacketConn models dialer/ftcp, where one Read yields one packet:
 // the reply arrives whole and coalesced payload is not lost.
 func TestReadReplyPacketConn(t *testing.T) {
+	// Reply plus a payload larger than one SOCKS reply must still arrive whole
+	// in a single packet read.
+	big := bytes.Repeat([]byte("x"), 1000)
 	packets := [][]byte{
-		append(buildReply(gosocks5.Succeeded, "198.51.100.9", "7070"), "server-first-data"...),
+		append(buildReply(gosocks5.Succeeded, "198.51.100.9", "7070"), big...),
 		[]byte("next-packet"),
 	}
 	c := newReplyConn(&packetConn{packets: packets})
@@ -168,8 +171,8 @@ func TestReadReplyPacketConn(t *testing.T) {
 		t.Fatalf("Addr = %v", rep.Addr)
 	}
 	rest, _ := io.ReadAll(c)
-	if want := "server-first-datanext-packet"; string(rest) != want {
-		t.Fatalf("remaining = %q, want %q", rest, want)
+	if want := string(big) + "next-packet"; string(rest) != want {
+		t.Fatalf("remaining = %d bytes, want %d", len(rest), len(want))
 	}
 }
 
