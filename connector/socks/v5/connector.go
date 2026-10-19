@@ -114,7 +114,6 @@ func (c *socks5Connector) Connect(ctx context.Context, conn net.Conn, network, a
 	})
 	log.Debugf("connect %s/%s", address, network)
 
-	conn = newReplyConn(conn)
 	if c.md.connectTimeout > 0 {
 		conn.SetDeadline(time.Now().Add(c.md.connectTimeout))
 		defer func() { conn.SetDeadline(time.Time{}) }()
@@ -139,6 +138,8 @@ func (c *socks5Connector) Connect(ctx context.Context, conn net.Conn, network, a
 		log.Error(err)
 		return nil, err
 	}
+
+	conn = newReplyConn(conn)
 
 	addr := gosocks5.Addr{}
 	if err := addr.ParseFrom(address); err != nil {
@@ -191,7 +192,7 @@ func (c *socks5Connector) connectUDP(ctx context.Context, conn net.Conn, network
 		return nil, err
 	}
 
-	reply, err := readReply(conn)
+	reply, err := gosocks5.ReadReply(conn)
 	if err != nil {
 		log.Error(err)
 		return nil, err
@@ -213,7 +214,7 @@ func (c *socks5Connector) relayUDP(ctx context.Context, conn net.Conn, addr net.
 		return nil, err
 	}
 
-	reply, err := readReply(conn)
+	reply, err := gosocks5.ReadReply(conn)
 	if err != nil {
 		log.Error(err)
 		return nil, err

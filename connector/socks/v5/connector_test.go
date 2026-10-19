@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,3 +100,33 @@ func TestConnectorPreservesServerFirstPayload(t *testing.T) {
 	}
 
 }
+
+func TestConnectRejectsTCPOverPacketConn(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	c := NewConnector(connector.LoggerOption(xlogger.Nop()))
+	if err := c.Init(nil); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	_, err = c.Connect(context.Background(), pcConn{pc}, "tcp", "target.example.com:80")
+	if err == nil || !strings.Contains(err.Error(), "tcp over udp is unsupported") {
+		t.Fatalf("err = %v, want tcp-over-udp rejection", err)
+	}
+}
+
+// pcConn presents a PacketConn as a Conn, like a UDP-backed connector.
+type pcConn struct {
+	net.PacketConn
+}
+
+func (c pcConn) Read(p []byte) (int, error)         { return 0, io.EOF }
+func (c pcConn) Write(p []byte) (int, error)        { return len(p), nil }
+func (c pcConn) RemoteAddr() net.Addr               { return c.PacketConn.LocalAddr() }
+func (c pcConn) SetDeadline(t time.Time) error      { return nil }
+func (c pcConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c pcConn) SetWriteDeadline(t time.Time) error { return nil }
