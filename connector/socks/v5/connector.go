@@ -116,7 +116,7 @@ func (c *socks5Connector) Connect(ctx context.Context, conn net.Conn, network, a
 
 	if c.md.connectTimeout > 0 {
 		conn.SetDeadline(time.Now().Add(c.md.connectTimeout))
-		defer conn.SetDeadline(time.Time{})
+		defer func() { conn.SetDeadline(time.Time{}) }()
 	}
 
 	var cOpts connector.ConnectOptions
@@ -139,6 +139,8 @@ func (c *socks5Connector) Connect(ctx context.Context, conn net.Conn, network, a
 		return nil, err
 	}
 
+	conn = newReplyConn(conn)
+
 	addr := gosocks5.Addr{}
 	if err := addr.ParseFrom(address); err != nil {
 		log.Error(err)
@@ -156,7 +158,7 @@ func (c *socks5Connector) Connect(ctx context.Context, conn net.Conn, network, a
 		return nil, err
 	}
 
-	reply, err := gosocks5.ReadReply(conn)
+	reply, err := readReply(conn)
 	if err != nil {
 		log.Error(err)
 		return nil, err
